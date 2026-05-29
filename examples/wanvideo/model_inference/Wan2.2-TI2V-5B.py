@@ -1,18 +1,21 @@
+import glob
 import torch
 from PIL import Image
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from modelscope import dataset_snapshot_download
 
+LOCAL_CKPT = "/work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B"
+
 pipe = WanVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
     device="cuda",
     model_configs=[
-        ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-        ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-        ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth"),
+        ModelConfig(path=f"{LOCAL_CKPT}/models_t5_umt5-xxl-enc-bf16.pth"),
+        ModelConfig(path=sorted(glob.glob(f"{LOCAL_CKPT}/diffusion_pytorch_model*.safetensors"))),
+        ModelConfig(path=f"{LOCAL_CKPT}/Wan2.2_VAE.pth"),
     ],
-    tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
+    tokenizer_config=ModelConfig(path=f"{LOCAL_CKPT}/google/umt5-xxl"),
 )
 
 # Text-to-video

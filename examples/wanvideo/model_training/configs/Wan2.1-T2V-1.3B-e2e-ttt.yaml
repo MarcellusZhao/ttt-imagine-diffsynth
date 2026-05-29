@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E-TTT meta-training config for Wan2.1-T2V-1.3B.
+#
+# Run with:
+#   accelerate launch examples/wanvideo/model_training/train_e2e_ttt.py \
+#       --config examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt.yaml
+#
+# Sections are organizational only; every leaf key maps to an argparse flag of the
+# same name (see `train_e2e_ttt.py`). Any flag passed on the CLI overrides the YAML.
+#
+# Memorize→predict chunking: each video is split into `e2e_num_chunks` ordered
+# sub-clips of `e2e_frames_per_chunk` (4n+1) frames, VAE-encoded independently.
+# Requires num_frames >= e2e_num_chunks * e2e_frames_per_chunk and num_frames % 4 == 1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+dataset:
+  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video/bdd100k
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/bdd100k/train_diffsynth.csv
+  dataset_repeat: 100
+  height: 480
+  width: 832
+  num_frames: 81
+
+model:
+  model_paths:
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+train:
+  learning_rate: 1.0e-5
+  num_epochs: 5
+  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt
+  remove_prefix_in_ckpt: pipe.dit.
+
+lora:
+  lora_base_model: dit
+  lora_target_modules: [q, k, v, o, ffn.0, ffn.2]
+  lora_rank: 32
+
+e2e_ttt:
+  e2e_num_chunks: 3
+  e2e_frames_per_chunk: 21
+  e2e_num_gradient_steps: 1
+  e2e_num_mc_samples: 2
+  e2e_inner_lr: 5.0e-5
+  e2e_max_inner_grad_norm: 1.0
+  e2e_inner_optimizer: sgd
+  e2e_truncate_steps: []      # full second-order through the inner step(s)
+  e2e_sigma_shift: 5.0

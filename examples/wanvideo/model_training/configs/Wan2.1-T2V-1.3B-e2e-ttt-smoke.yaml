@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SMOKE-TEST variant of Wan2.1-T2V-1.3B-e2e-ttt.yaml.
+#
+# Validates the full memorize→predict path end-to-end (forward, SECOND-ORDER
+# backward, one outer optimizer step) cheaply:
+#   * e2e_num_chunks: 2          → exactly ONE memorize→predict pair (shallowest graph)
+#   * e2e_num_mc_samples: 1      → one (t, noise) draw per loss eval
+#   * e2e_truncate_steps: []     → keep full second-order (this is what we want to test)
+#   * dataset_repeat: 1, num_epochs: 1 → ~8 steps total over the 8-clip bdd100k set
+# If this survives a few steps without OOM/erroring, the double-backward machinery works.
+# ─────────────────────────────────────────────────────────────────────────────
+
+dataset:
+  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video/bdd100k
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/bdd100k/train_diffsynth.csv
+  dataset_repeat: 1
+  # 352x512 (÷16) → ~2,816 DiT tokens/chunk vs ~3,456 at 384x576 → ~0.66x the
+  # O(seq²) attention memory. The exact second-order double-backward parks near the
+  # 93 GB ceiling at 384x576 (step 1 fits, but the outer AdamW's moment buffers,
+  # allocated after step 1, then push step 2 over). This trim leaves steady-state
+  # headroom; bump it back up if you have margin to spare.
+  height: 352
+  width: 512
+  num_frames: 26              # first 26 frames are used (2 chunks * 13)
+
+model:
+  model_paths:
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+train:
+  learning_rate: 1.0e-5
+  num_epochs: 1
+  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_smoke
+  remove_prefix_in_ckpt: pipe.dit.
+  # Activation checkpointing is carried through the second-order recompute by the
+  # override path (see _override_checkpointed_blocks). Without it the memorize +
+  # predict forwards retain all 30 layers' activations and OOM ~90 GB on one H100.
+  use_gradient_checkpointing: true
+
+lora:
+  lora_base_model: dit
+  lora_target_modules: [q, k, v, o, ffn.0, ffn.2]
+  lora_rank: 32
+
+e2e_ttt:
+  e2e_num_chunks: 2
+  e2e_frames_per_chunk: 13
+  e2e_num_gradient_steps: 1
+  e2e_num_mc_samples: 1
+  e2e_inner_lr: 5.0e-5
+  e2e_max_inner_grad_norm: 1.0
+  e2e_inner_optimizer: sgd
+  e2e_truncate_steps: []
+  e2e_sigma_shift: 5.0
