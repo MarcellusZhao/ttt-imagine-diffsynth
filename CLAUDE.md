@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository identity
 
-This is a fork of **ModelScope DiffSynth-Studio** (`diffsynth` package, v2.x — see [pyproject.toml](pyproject.toml)). The directory is named `ttt-imagine-diffsynth` because it is vendored alongside the `ttt-imagine` (VideoTuna) project, but the code here is upstream DiffSynth-Studio with no TTT-specific additions — TTT meta-learning lives in the separate `ttt-imagine` repo. Treat this as a Diffusion model engine for inference and training of FLUX, Wan, Qwen-Image, Z-Image, LTX, HiDream, ACE-Step, Anima, MOVA, etc.
+This is a fork of **ModelScope DiffSynth-Studio** (`diffsynth` package, v2.x — see [pyproject.toml](pyproject.toml)). The directory is named `ttt-imagine-diffsynth` because it is vendored alongside the `ttt-imagine` (VideoTuna) project. The bulk of the code is upstream DiffSynth-Studio — treat it as a Diffusion model engine for inference and training of FLUX, Wan, Qwen-Image, Z-Image, LTX, HiDream, ACE-Step, Anima, MOVA, etc.
+
+**Local addition — End-to-End Test-Time Training (E2E-TTT):** ported from the reference in the sibling `ttt-imagine` repo (`e2e_ttt_video/`) into DiffSynth-native form for `Wan2.1-T2V-1.3B` and `Wan2.2-TI2V-5B`. See the E2E-TTT section below.
 
 Origin: `git@github.com:MarcellusZhao/ttt-imagine-diffsynth.git`. Upstream docs: https://diffsynth-studio-doc.readthedocs.io/en/latest/
 
@@ -77,6 +79,15 @@ Two distinct mechanisms — don't confuse them:
 - **Diffusion Templates** ([diffsynth/diffusion/template.py](diffsynth/diffusion/template.py)) — plugin framework loaded from a directory containing a `model.py`. Used by image-to-LoRA models and other custom controllable-generation plugins.
 - **NPU support** — [diffsynth/core/device/npu_compatible_device.py](diffsynth/core/device/npu_compatible_device.py) + [diffsynth/core/npu_patch/](diffsynth/core/npu_patch/) wrap device selection. Use `get_device_type()` instead of hardcoding `"cuda"` when adding new pipelines.
 - **Sequence parallel** — `enable_usp()` on pipelines swaps attention/forward methods via xfuser ([diffsynth/utils/xfuser/](diffsynth/utils/xfuser/)). See [examples/wanvideo/acceleration/unified_sequence_parallel.py](examples/wanvideo/acceleration/unified_sequence_parallel.py).
+
+## End-to-End Test-Time Training (E2E-TTT)
+
+A DiffSynth-native port of the `e2e_ttt_video/` algorithm from the sibling `ttt-imagine` repo. Long videos are generated chunk-by-chunk; the model adapts to its own preceding chunks via a LoRA "memory scratchpad", meta-trained MAML-style so a few inner-loop steps generalize to the *next* chunk.
+
+- **Core module** — [diffsynth/diffusion/e2e_ttt.py](diffsynth/diffusion/e2e_ttt.py): config dataclasses (`InnerLoopConfig`, `ChunkingConfig`, `InferenceConfig`), differentiable inner-loop optimizers (`DifferentiableSGD/AdamW/Muon/MuonClip`, `MetaLearnedLRSchedule`), LoRA-state helpers, the rectified-flow loss (reuses DiffSynth's `FlowMatchScheduler` + `pipe.model_fn`), the second-order `run_meta_inner_loop` (memorize→predict), the first-order test-time `ttt_update_inplace`, and `WanE2ETTTSequentialGenerator`.
+- **Meta-training** — [examples/wanvideo/model_training/train_e2e_ttt.py](examples/wanvideo/model_training/train_e2e_ttt.py) subclasses `WanTrainingModule`; its `forward` splits each video into chunks and returns the MAML meta-loss. Reuses the stock `launch_training_task` (no W0-restore hook needed: `write_back=False` keeps LoRA leaves at φ₀ so the outer AdamW updates φ₀ directly). Launchers: [Wan2.1-T2V-1.3B-e2e-ttt.sh](examples/wanvideo/model_training/lora/Wan2.1-T2V-1.3B-e2e-ttt.sh), [Wan2.2-TI2V-5B-e2e-ttt.sh](examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B-e2e-ttt.sh).
+- **Sequential inference** — [Wan2.1-T2V-1.3B-e2e-ttt.py](examples/wanvideo/model_inference/Wan2.1-T2V-1.3B-e2e-ttt.py), [Wan2.2-TI2V-5B-e2e-ttt.py](examples/wanvideo/model_inference/Wan2.2-TI2V-5B-e2e-ttt.py). Set `E2E_TTT_LORA=<ckpt>` to load a meta-trained φ₀ (otherwise starts from a zero-init identity adapter).
+- **Two correctness constraints** (both handled in code): (1) second-order grads require double-backward attention — `enable_double_backward_attention()` disables fused flash/sage kernels and pins math SDPA; (2) the differentiable override path must run **without** activation checkpointing (non-reentrant checkpoint recomputes after the param-override context exits), enforced in `compute_flow_matching_loss`.
 
 ## Where the deep docs live
 
