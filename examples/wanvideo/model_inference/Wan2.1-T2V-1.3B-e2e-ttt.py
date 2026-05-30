@@ -19,7 +19,7 @@ from diffsynth.diffusion.e2e_ttt import (
 )
 
 LOCAL_CKPT = "/work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B"
-E2E_TTT_LORA = os.environ.get("E2E_TTT_LORA", None)  # optional meta-trained LoRA phi_0
+E2E_TTT_LORA = "/home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.1-T2V-1.3B_e2e_ttt_smoke-20260530-130559/epoch-0.safetensors"  # optional meta-trained LoRA phi_0
 
 pipe = WanVideoPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
@@ -42,16 +42,16 @@ phi0 = inject_lora_for_ttt(
 
 inner_cfg = InnerLoopConfig(
     num_gradient_steps=1,
-    num_mc_samples=2,
+    num_mc_samples=1,
     inner_lr_init=5e-5,
     max_inner_grad_norm=1.0,
 )
 infer_cfg = InferenceConfig(
-    num_chunks=4,
-    frames_per_chunk=49,   # 4n+1
+    num_chunks=2,
+    frames_per_chunk=13,   # 4n+1
     ttt_steps_per_chunk=1,
-    height=480,
-    width=832,
+    height=352,
+    width=512,
     num_inference_steps=50,
     cfg_scale=5.0,
     sigma_shift=5.0,
