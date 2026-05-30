@@ -71,7 +71,7 @@ def launch_training_task(
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                model_logger.on_step_end(accelerator, model, save_steps, loss=loss, lr=optimizer.param_groups[0]["lr"])
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 

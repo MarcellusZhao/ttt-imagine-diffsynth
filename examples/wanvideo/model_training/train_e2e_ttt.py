@@ -15,7 +15,7 @@ unmodified ``launch_training_task`` loop is correct with no W0-restore hook need
 Targets: Wan2.1-T2V-1.3B and Wan2.2-TI2V-5B (single-DiT Wan pipelines).
 """
 
-import torch, os, json, argparse, accelerate
+import torch, os, json, argparse, accelerate, datetime
 from diffsynth.core import UnifiedDataset
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig, WanVideoUnit_PromptEmbedder
 from diffsynth.diffusion import *
@@ -45,11 +45,17 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_min_timestep_boundary=0.0,
         e2e_max_timestep_boundary=1.0,
         e2e_sigma_shift=5.0,
+        outer_lr=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         # Second-order meta-training needs double-backward-capable attention.
         enable_double_backward_attention()
+        # Nominal outer-loop (meta) learning rate, logged alongside the inner-loop LR.
+        # The optimizer is built in launch_training_task, so the live (scheduler-adjusted)
+        # value is logged separately by the runner as the generic "lr" key; this is the
+        # configured value, symmetric with inner_cfg.inner_lr_init.
+        self.outer_lr = float(outer_lr) if outer_lr is not None else None
         self.chunk_cfg = ChunkingConfig(
             num_chunks=int(e2e_num_chunks),
             frames_per_chunk=int(e2e_frames_per_chunk),
@@ -68,6 +74,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         self.train_scheduler = make_training_scheduler(float(e2e_sigma_shift))
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
               f"chunks={self.chunk_cfg.num_chunks} x {self.chunk_cfg.frames_per_chunk}f | "
+              f"outer_lr={self.outer_lr} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
               f"steps={self.inner_cfg.num_gradient_steps} mc={self.inner_cfg.num_mc_samples} | "
               f"truncate_steps={self.truncate_steps}")
@@ -127,6 +134,18 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             write_back=False,
         )
+        # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
+        # `meta_loss` is logged separately as the generic "loss"; these add the MAML-specific
+        # breakdown (all detached — they must never touch the second-order meta-graph).
+        self.log_metrics = {
+            "train/meta_loss": meta_loss.detach(),
+            "train/memorize_loss": stats["memorize_loss"].detach() if torch.is_tensor(stats["memorize_loss"]) else stats["memorize_loss"],
+            "train/num_pred_pairs": float(stats["num_pred"]),
+            "train/num_mem_steps": float(stats["num_mem_steps"]),
+            "train/inner_lr": float(self.inner_cfg.inner_lr_init),
+        }
+        if self.outer_lr is not None:
+            self.log_metrics["train/outer_lr"] = self.outer_lr
         return meta_loss
 
 
@@ -206,6 +225,16 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
+    # Give each run its own timestamped output dir so reruns don't overwrite the previous
+    # run's epoch-*.safetensors / step-*.safetensors / wandb logs. The timestamp is generated
+    # on the main process and broadcast so every rank in a multi-GPU run agrees on one folder
+    # (otherwise each rank would stamp its own time and the saves would scatter). The suffix
+    # keeps the basename self-describing, so the default wandb run name stays meaningful.
+    run_stamp = [datetime.datetime.now().strftime("%Y%m%d-%H%M%S")] if accelerator.is_main_process else [None]
+    accelerate.utils.broadcast_object_list(run_stamp, from_process=0)
+    args.output_path = f"{os.path.normpath(args.output_path)}-{run_stamp[0]}"
+    if accelerator.is_main_process:
+        print(f"[E2E-TTT] Run outputs -> {args.output_path}")
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -254,6 +283,7 @@ if __name__ == "__main__":
         e2e_min_timestep_boundary=args.e2e_min_timestep_boundary,
         e2e_max_timestep_boundary=args.e2e_max_timestep_boundary,
         e2e_sigma_shift=args.e2e_sigma_shift,
+        outer_lr=args.learning_rate,
     )
     model_logger = ModelLogger(
         args.output_path,
@@ -261,5 +291,9 @@ if __name__ == "__main__":
         enable_tensorboard_log=args.enable_tensorboard_log,
         enable_swanlab_log=args.enable_swanlab_log,
         enable_wandb_log=args.enable_wandb_log,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity,
+        config=vars(args),
     )
     launch_training_task(accelerator, dataset, model, model_logger, args=args)
