@@ -51,11 +51,15 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         super().__init__(*args, **kwargs)
         # Second-order meta-training needs double-backward-capable attention.
         enable_double_backward_attention()
-        # Nominal outer-loop (meta) learning rate, logged alongside the inner-loop LR.
-        # The optimizer is built in launch_training_task, so the live (scheduler-adjusted)
-        # value is logged separately by the runner as the generic "lr" key; this is the
-        # configured value, symmetric with inner_cfg.inner_lr_init.
+        # Nominal outer-loop (meta) learning rate, shown in the startup banner. The value
+        # actually logged each step (train/meta_lr) is the LIVE optimizer LR supplied by the
+        # runner — see lr_log_key below — so it reflects any scheduler warmup, not this const.
         self.outer_lr = float(outer_lr) if outer_lr is not None else None
+        # Keep every chart under the wandb "train" group: log the live outer LR as
+        # "train/meta_lr" and drop the bare "loss" (the module's own "train/meta_loss" is
+        # the same quantity). ModelLogger reads these two attributes; None suppresses.
+        self.lr_log_key = "train/meta_lr"
+        self.loss_log_key = None
         self.chunk_cfg = ChunkingConfig(
             num_chunks=int(e2e_num_chunks),
             frames_per_chunk=int(e2e_frames_per_chunk),
@@ -137,6 +141,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
         # `meta_loss` is logged separately as the generic "loss"; these add the MAML-specific
         # breakdown (all detached — they must never touch the second-order meta-graph).
+        # train/meta_lr (the live outer LR) is added by ModelLogger via lr_log_key, not here.
         self.log_metrics = {
             "train/meta_loss": meta_loss.detach(),
             "train/memorize_loss": stats["memorize_loss"].detach() if torch.is_tensor(stats["memorize_loss"]) else stats["memorize_loss"],
@@ -144,8 +149,6 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             "train/num_mem_steps": float(stats["num_mem_steps"]),
             "train/inner_lr": float(self.inner_cfg.inner_lr_init),
         }
-        if self.outer_lr is not None:
-            self.log_metrics["train/outer_lr"] = self.outer_lr
         return meta_loss
 
 

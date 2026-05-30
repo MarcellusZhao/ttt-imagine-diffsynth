@@ -118,18 +118,26 @@ class ModelLogger:
         if accelerator.is_main_process:
             if not self.loggers_initialized:
                 self.init_loggers()
+            unwrapped = accelerator.unwrap_model(model)
             metrics = {}
+            # The generic loss / live-lr keys are logged under "loss" / "lr" by default,
+            # but a training module may rename them (or set the key to None to suppress)
+            # via `loss_log_key` / `lr_log_key`. E.g. E2E-TTT logs the live optimizer LR as
+            # "train/meta_lr" and drops the bare "loss" in favour of its own "train/meta_loss",
+            # so every chart lands under the wandb "train" group.
             loss = kwargs.get("loss")
-            if loss is not None:
-                metrics["loss"] = self._scalar(loss)
+            loss_key = getattr(unwrapped, "loss_log_key", "loss")
+            if loss is not None and loss_key is not None:
+                metrics[loss_key] = self._scalar(loss)
             lr = kwargs.get("lr")
-            if lr is not None:
-                metrics["lr"] = self._scalar(lr)
+            lr_key = getattr(unwrapped, "lr_log_key", "lr")
+            if lr is not None and lr_key is not None:
+                metrics[lr_key] = self._scalar(lr)
             # Extra per-step diagnostics: an explicit `metrics=` kwarg, or a `log_metrics`
             # dict the training module sets on its `forward` (e.g. the E2E-TTT inner-loop
             # stats — memorize_loss, num_pred_pairs, inner_lr). Both are optional, so vanilla
             # SFT training keeps logging just loss/lr.
-            extra = kwargs.get("metrics") or getattr(accelerator.unwrap_model(model), "log_metrics", None)
+            extra = kwargs.get("metrics") or getattr(unwrapped, "log_metrics", None)
             if extra:
                 for key, value in extra.items():
                     metrics[key] = self._scalar(value)

@@ -48,9 +48,10 @@ lora:
 # Weights & Biases monitoring. Offline by default (safe on air-gapped compute
 # nodes) — runs land in <output_path>/wandb_log; `export WANDB_MODE=online` to
 # stream live, or `disabled` to turn off without editing this file. The run name
-# defaults to the output_path basename. Logged each step: loss, lr, and the
-# E2E-TTT inner-loop diagnostics (train/meta_loss, train/memorize_loss,
-# train/num_pred_pairs, train/num_mem_steps, train/inner_lr).
+# defaults to the output_path basename. All metrics are logged under the wandb
+# "train" group each step: train/meta_loss, train/memorize_loss,
+# train/num_pred_pairs, train/num_mem_steps, train/inner_lr, and train/meta_lr
+# (the live outer-loop LR).
 logger:
   enable_wandb_log: true
   wandb_project: ttt-imagine-diffsynth
