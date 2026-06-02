@@ -68,6 +68,23 @@ def launch_training_task(
                 accelerator.backward(loss)
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
+                # Optional global grad-norm logging: only once grads are synced (accum-correct)
+                # and only for modules that opt in via `log_grad_norm`. Stashed into the
+                # module's `log_metrics` so ModelLogger.on_step_end picks it up alongside the
+                # forward-time diagnostics. No-op (and untouched behaviour) for every other family.
+                if accelerator.sync_gradients:
+                    unwrapped = accelerator.unwrap_model(model)
+                    if getattr(unwrapped, "log_grad_norm", False):
+                        total_sq = None
+                        for p in unwrapped.trainable_modules():
+                            if p.grad is not None:
+                                g = p.grad.detach().float().pow(2).sum()
+                                total_sq = g if total_sq is None else total_sq + g
+                        if total_sq is not None:
+                            if getattr(unwrapped, "log_metrics", None) is None:
+                                unwrapped.log_metrics = {}
+                            key = getattr(unwrapped, "grad_norm_log_key", "train/grad_norm")
+                            unwrapped.log_metrics[key] = total_sq.sqrt()
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()

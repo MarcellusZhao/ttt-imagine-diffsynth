@@ -15,13 +15,17 @@ unmodified ``launch_training_task`` loop is correct with no W0-restore hook need
 Targets: Wan2.1-T2V-1.3B and Wan2.2-TI2V-5B (single-DiT Wan pipelines).
 """
 
-import torch, os, json, argparse, accelerate, datetime
+import torch, os, json, argparse, accelerate, datetime, resource
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from diffsynth.core import UnifiedDataset
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig, WanVideoUnit_PromptEmbedder
 from diffsynth.diffusion import *
 from diffsynth.diffusion.e2e_ttt import (
     InnerLoopConfig, ChunkingConfig, make_training_scheduler, run_meta_inner_loop,
-    count_lora_params, enable_double_backward_attention,
+    count_lora_params, enable_double_backward_attention, get_lora_params,
 )
 
 # Reuse the vanilla module so all the model-loading / LoRA-injection plumbing is shared.
@@ -45,12 +49,24 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_min_timestep_boundary=0.0,
         e2e_max_timestep_boundary=1.0,
         e2e_sigma_shift=5.0,
+        e2e_first_order=False,
         outer_lr=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # Second-order meta-training needs double-backward-capable attention.
-        enable_double_backward_attention()
+        # Second-order meta-training needs double-backward-capable attention. FOMAML
+        # only ever does a single backward, so fused flash/sage kernels are fine.
+        if not e2e_first_order:
+            enable_double_backward_attention()
+        # --- training-dynamics logging state ---
+        # Previous-step LoRA snapshot, used to measure the *realized* per-step update
+        # (||phi_t - phi_{t-1}|| / ||phi_t||) without needing post-backward grad access.
+        self._prev_lora = None
+        # Opt this module in to the runner's post-backward global grad-norm logging
+        # (computed once grads are synced, written into self.log_metrics). The grad is the
+        # OUTER (meta) gradient on phi_0, so name it with the "meta_" convention.
+        self.log_grad_norm = True
+        self.grad_norm_log_key = "train/meta_grad_norm"
         # Nominal outer-loop (meta) learning rate, shown in the startup banner. The value
         # actually logged each step (train/meta_lr) is the LIVE optimizer LR supplied by the
         # runner — see lr_log_key below — so it reflects any scheduler warmup, not this const.
@@ -72,6 +88,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             min_timestep_boundary=float(e2e_min_timestep_boundary),
             max_timestep_boundary=float(e2e_max_timestep_boundary),
             optimizer=str(e2e_inner_optimizer),
+            first_order=bool(e2e_first_order),
         )
         self.truncate_steps = [int(s) for s in str(e2e_truncate_steps).split(",") if s != ""]
         # Dedicated 1000-step training scheduler (does not touch any inference scheduler).
@@ -79,6 +96,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
               f"chunks={self.chunk_cfg.num_chunks} x {self.chunk_cfg.frames_per_chunk}f | "
               f"outer_lr={self.outer_lr} | "
+              f"order={'first (FOMAML)' if self.inner_cfg.first_order else 'second'} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
               f"steps={self.inner_cfg.num_gradient_steps} mc={self.inner_cfg.num_mc_samples} | "
               f"truncate_steps={self.truncate_steps}")
@@ -125,6 +143,70 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         torch.cuda.empty_cache()
         return chunk_latents, context
 
+    @torch.no_grad()
+    def _lora_dynamics_metrics(self):
+        """Read-only LoRA training-dynamics metrics, computed on the meta-init phi_0
+        *entering* this step. Returns a flat dict for ModelLogger. Never touches the
+        meta-graph (no_grad + detach throughout)."""
+        dit = self.pipe.dit
+        out = {}
+
+        # --- Effective injected-update ratio: ||dW||_F / ||W_base||_F per LoRA-wrapped
+        # linear, where dW = scaling * (B @ A). B is zero-init, so this is exactly how
+        # much the adapter has moved the frozen base weight. Aggregate mean/max + a
+        # per-module-type breakdown (q/k/v/o/ffn.0/ffn.2).
+        ratios, per_type = [], {}
+        for name, mod in dit.named_modules():
+            lora_A = getattr(mod, "lora_A", None)
+            if lora_A is None or len(lora_A) == 0:
+                continue
+            adapter = next(iter(lora_A.keys()))            # PEFT adapter name (usually 'default')
+            A = mod.lora_A[adapter].weight
+            B = mod.lora_B[adapter].weight
+            scale = mod.scaling[adapter]
+            dW = scale * (B.float() @ A.float())
+            base = mod.base_layer.weight.float()
+            r = (dW.norm() / (base.norm() + 1e-8)).item()
+            ratios.append(r)
+            parts = name.split(".")
+            key = parts[-1] if not parts[-1].isdigit() else f"{parts[-2]}.{parts[-1]}"
+            per_type.setdefault(key, []).append(r)
+        # phi_0 is updated by the OUTER optimizer, so these cumulative-change metrics use
+        # the "meta_" naming convention.
+        if ratios:
+            out["lora/meta_dW_ratio_mean"] = sum(ratios) / len(ratios)
+            out["lora/meta_dW_ratio_max"] = max(ratios)
+            for k, v in per_type.items():
+                out[f"lora/meta_dW_ratio/{k}"] = sum(v) / len(v)
+
+        # --- Realized update-to-weight ratio: ||phi_t - phi_{t-1}|| / ||phi_t|| over all
+        # LoRA params. This is the true optimizer step size (incl. lr/wd/Adam precond),
+        # one step lagged. Skipped on the first step (no previous snapshot yet).
+        cur = get_lora_params(dit)
+        if self._prev_lora is not None:
+            delta_sq, norm_sq = 0.0, 0.0
+            for n, p in cur.items():
+                pf = p.detach().float()
+                norm_sq += pf.pow(2).sum().item()
+                if n in self._prev_lora:
+                    delta_sq += (pf - self._prev_lora[n]).pow(2).sum().item()
+            out["lora/meta_update_ratio"] = (delta_sq ** 0.5) / ((norm_sq ** 0.5) + 1e-8)
+        self._prev_lora = {n: p.detach().float().clone() for n, p in cur.items()}
+
+        # --- GPU memory high-water mark (GB). Given the second-order backward parks at
+        # the memory ceiling, this is the practical "how close to OOM" signal.
+        if torch.cuda.is_available():
+            out["gpu/mem_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+            out["gpu/mem_alloc_gb"] = torch.cuda.memory_allocated() / 1e9
+
+        # --- CPU (process RSS) memory. Matters when offload streams frozen weights to host
+        # RAM. mem_peak is the monotonic high-water mark (ru_maxrss, KB on Linux); mem_alloc
+        # is the current resident set size.
+        out["cpu/mem_peak_gb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        if psutil is not None:
+            out["cpu/mem_alloc_gb"] = psutil.Process().memory_info().rss / 1e9
+        return out
+
     def forward(self, data, inputs=None):
         chunk_latents, context = self._encode_chunks(data)
         self.pipe.load_models_to_device(["dit"])
@@ -137,6 +219,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             truncate_steps=self.truncate_steps,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             write_back=False,
+            first_order=self.inner_cfg.first_order,
         )
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
         # `meta_loss` is logged separately as the generic "loss"; these add the MAML-specific
@@ -149,6 +232,12 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             "train/num_mem_steps": float(stats["num_mem_steps"]),
             "train/inner_lr": float(self.inner_cfg.inner_lr_init),
         }
+        # Inner adaptation magnitude: how far the inner loop moved phi_0 per video.
+        if "inner_adapt_norm" in stats:
+            self.log_metrics["lora/inner_adapt_norm"] = stats["inner_adapt_norm"].detach()
+            self.log_metrics["lora/inner_adapt_ratio"] = stats["inner_adapt_ratio"].detach()
+        # ΔW ratio (mean/max/per-type), realized update-to-weight ratio, GPU mem.
+        self.log_metrics.update(self._lora_dynamics_metrics())
         return meta_loss
 
 
@@ -156,6 +245,8 @@ def e2e_ttt_parser():
     parser = wan_parser()
     parser.add_argument("--config", type=str, default=None,
                         help="Path to a YAML config supplying argument defaults (CLI flags still override).")
+    parser.add_argument("--frame_rate", type=int, default=24,
+                        help="Target frame rate (fps) for sampling video frames in the data operator.")
     g = parser.add_argument_group("E2E-TTT")
     g.add_argument("--e2e_num_chunks", type=int, default=3, help="Number of temporal chunks per video.")
     g.add_argument("--e2e_frames_per_chunk", type=int, default=21, help="Frames per chunk (4n+1).")
@@ -168,6 +259,9 @@ def e2e_ttt_parser():
     g.add_argument("--e2e_min_timestep_boundary", type=float, default=0.0, help="Min timestep fraction for inner loss.")
     g.add_argument("--e2e_max_timestep_boundary", type=float, default=1.0, help="Max timestep fraction for inner loss.")
     g.add_argument("--e2e_sigma_shift", type=float, default=5.0, help="Flow-matching sigma shift for the TTT scheduler.")
+    g.add_argument("--e2e_first_order", action="store_true",
+                   help="First-order MAML (FOMAML): drop the Hessian term. Frees the inner-loop "
+                        "graph, allows fused attention, and ignores --e2e_truncate_steps.")
     return parser
 
 
@@ -253,6 +347,7 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             time_division_factor=4,
             time_division_remainder=1,
+            frame_rate=args.frame_rate
         ),
     )
     model = WanE2ETTTTrainingModule(
@@ -286,6 +381,7 @@ if __name__ == "__main__":
         e2e_min_timestep_boundary=args.e2e_min_timestep_boundary,
         e2e_max_timestep_boundary=args.e2e_max_timestep_boundary,
         e2e_sigma_shift=args.e2e_sigma_shift,
+        e2e_first_order=args.e2e_first_order,
         outer_lr=args.learning_rate,
     )
     model_logger = ModelLogger(

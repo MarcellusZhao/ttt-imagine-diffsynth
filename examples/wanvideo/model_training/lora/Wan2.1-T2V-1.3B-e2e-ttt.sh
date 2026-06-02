@@ -5,7 +5,7 @@
 #   ... --config <other.yaml>            # or point at the smoke config
 set -e
 
-CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt.yaml}"
+CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt-smoke.yaml}"
 
 # The exact second-order meta-backward parks right at the GPU's memory ceiling, and
 # the allocator strands ~1 GB as "reserved but unallocated" (fragmentation).

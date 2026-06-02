@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FOMAML (first-order) variant of Wan2.1-T2V-1.3B-e2e-ttt-smoke.yaml.
+#
+# Identical to the smoke config except for `e2e_first_order: true`. FOMAML drops
+# the Hessian term from the meta-gradient: the inner-loop graph is freed each step,
+# fused flash/sage attention is allowed (no math-SDPA pin), and `e2e_truncate_steps`
+# is ignored. Validates the full memorize→predict path end-to-end (forward,
+# FIRST-ORDER backward, one outer optimizer step) cheaply:
+#   * e2e_num_chunks: 2          → exactly ONE memorize→predict pair (shallowest graph)
+#   * e2e_num_mc_samples: 1      → one (t, noise) draw per loss eval
+#   * dataset_repeat: 1, num_epochs: 1 → ~8 steps total over the 8-clip bdd100k set
+# ─────────────────────────────────────────────────────────────────────────────
+
+dataset:
+  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/train_diffsynth_merged.csv
+  dataset_repeat: 1
+  # 352x512 (÷16) → ~2,816 DiT tokens/chunk vs ~3,456 at 384x576 → ~0.66x the
+  # O(seq²) attention memory. FOMAML's single-backward path uses far less memory
+  # than the second-order double-backward, so there is more headroom here; bump the
+  # resolution back up if you want.
+  height: 352
+  width: 512
+  num_frames: 26              # first 26 frames are used (2 chunks * 13)
+  frame_rate: 16
+
+model:
+  model_paths:
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/google/umt5-xxl
+
+train:
+  learning_rate: 1.0e-5
+  num_epochs: 1
+  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_smoke
+  remove_prefix_in_ckpt: pipe.dit.
+  # Activation checkpointing is carried through the recompute by the override path
+  # (see _override_checkpointed_blocks). Without it the memorize + predict forwards
+  # retain all 30 layers' activations and OOM ~90 GB on one H100.
+  use_gradient_checkpointing: true
+
+lora:
+  lora_base_model: dit
+  lora_target_modules: [q, k, v, o, ffn.0, ffn.2]
+  lora_rank: 32
+
+# Weights & Biases monitoring. Offline by default (safe on air-gapped compute
+# nodes) — runs land in <output_path>/wandb_log; `export WANDB_MODE=online` to
+# stream live, or `disabled` to turn off without editing this file. The run name
+# defaults to the output_path basename. All metrics are logged under the wandb
+# "train" group each step: train/meta_loss, train/memorize_loss,
+# train/num_pred_pairs, train/num_mem_steps, train/inner_lr, and train/meta_lr
+# (the live outer-loop LR).
+logger:
+  enable_wandb_log: true
+  wandb_project: ttt-imagine-diffsynth
+
+e2e_ttt:
+  e2e_num_chunks: 2
+  e2e_frames_per_chunk: 13
+  e2e_num_gradient_steps: 1
+  e2e_num_mc_samples: 1
+  e2e_inner_lr: 5.0e-5
+  e2e_max_inner_grad_norm: 1.0
+  e2e_inner_optimizer: sgd
+  e2e_truncate_steps: []
+  e2e_sigma_shift: 5.0
+  e2e_first_order: true         # FOMAML: drop the Hessian term

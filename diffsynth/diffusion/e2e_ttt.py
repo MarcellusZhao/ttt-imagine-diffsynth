@@ -123,6 +123,10 @@ class InnerLoopConfig:
     optimizer: str = "sgd"  # one of: sgd, adamw, muon, muonclip
     # PERK-style meta-learned per-(param, step) learning rates (training only).
     meta_learn_lr: bool = False
+    # First-order MAML (FOMAML): drop the Hessian term from the meta-gradient
+    # (inner grads become constants, create_graph=False). Frees the inner-loss
+    # graph immediately and removes the double-backward attention requirement.
+    first_order: bool = False
 
 
 @dataclass
@@ -605,6 +609,7 @@ def run_meta_inner_loop(
     learned_lrs: Optional[MetaLearnedLRSchedule] = None,
     use_gradient_checkpointing: bool = False,
     write_back: bool = False,
+    first_order: bool = False,
 ):
     """Differentiable memorize->predict MAML inner loop over chunk sequences.
 
@@ -615,12 +620,19 @@ def run_meta_inner_loop(
             memorize chunk k   -> inner SGD step(s) on LoRA   (phi_k -> phi_{k+1})
             predict  chunk k+1 -> accumulate L'_{k+1}(phi_{k+1}) into the meta-loss
 
-    Returns ``(meta_loss, stats)``. ``meta_loss`` is second-order (create_graph=True),
-    so ``meta_loss.backward()`` populates grads on the real LoRA leaves (phi_0). With
-    ``write_back=False`` the real leaves are never mutated, so the outer optimizer
-    updates phi_0 directly.
+    Returns ``(meta_loss, stats)``. ``meta_loss.backward()`` populates grads on the
+    real LoRA leaves (phi_0); with ``write_back=False`` the real leaves are never
+    mutated, so the outer optimizer updates phi_0 directly. By default the meta-loss
+    is second-order (create_graph=True). With ``first_order=True`` (FOMAML) the inner
+    grads are detached, dropping the Hessian term and the double-backward requirement.
     """
     truncate_steps = truncate_steps or []
+    if first_order and truncate_steps:
+        # FOMAML keeps phi connected to phi_0 only through the clone+update identity
+        # path; detaching at a truncation step would sever that path and zero the
+        # meta-gradient on phi_0. Truncation is meaningless without a second-order
+        # graph, so ignore it.
+        truncate_steps = []
     dit = pipe.dit
     base_params = dict(dit.named_parameters())
     lora_names = [n for n in base_params if "lora" in n and base_params[n].requires_grad]
@@ -661,9 +673,14 @@ def run_meta_inner_loop(
                 )
                 mem_loss_sum = mem_loss_sum + loss_mem.detach()
                 mem_count += 1
+                # Second-order: create_graph=True keeps grads differentiable so the
+                # outer backward carries the Hessian term. First-order (FOMAML):
+                # create_graph=False detaches grads (and frees the inner-loss graph,
+                # since retain_graph defaults to create_graph), leaving phi connected
+                # to phi_0 only via the clone+update identity path.
                 grads_list = torch.autograd.grad(
                     loss_mem, [current_lora[n] for n in lora_names],
-                    create_graph=True, allow_unused=True,
+                    create_graph=not first_order, allow_unused=True,
                 )
                 grads = {n: g for n, g in zip(lora_names, grads_list)}
                 current_lora = opt.step(current_lora, grads, learned_lrs=_resolve_lrs(mem_step_idx))
@@ -696,6 +713,21 @@ def run_meta_inner_loop(
         "num_pred": num_pred,
         "num_mem_steps": mem_count,
     }
+    # Inner adaptation magnitude: how far the inner loop moved the LoRA "scratchpad"
+    # away from the meta-init phi_0 for the last video (||phi_adapted - phi_0||, and the
+    # same normalised by ||phi_0||). Fully detached so it never enters the meta-graph;
+    # it measures whether the TTT memory mechanism is actually adapting per video.
+    if final_lora is not None:
+        with torch.no_grad():
+            delta_sq = torch.zeros((), device=device)
+            phi0_sq = torch.zeros((), device=device)
+            for n in lora_names:
+                phi0 = base_params[n].detach()
+                delta_sq = delta_sq + (final_lora[n].detach() - phi0).pow(2).sum()
+                phi0_sq = phi0_sq + phi0.pow(2).sum()
+            inner_delta = delta_sq.sqrt()
+            stats["inner_adapt_norm"] = inner_delta
+            stats["inner_adapt_ratio"] = inner_delta / (phi0_sq.sqrt() + 1e-8)
     return meta_loss / num_pred, stats
 
 
