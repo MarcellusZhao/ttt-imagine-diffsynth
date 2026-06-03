@@ -29,7 +29,7 @@ from typing import List, Optional
 from imageio_ffmpeg import get_ffmpeg_exe
 from tqdm import tqdm
 
-from data_utils.inspect_video import probe_video
+from inspect_video import probe_video
 
 
 def build_ffmpeg_cmd(

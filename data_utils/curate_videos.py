@@ -52,8 +52,8 @@ from typing import Any
 
 from tqdm import tqdm
 
-from data_utils.filters import FILTER_REGISTRY, VideoFilter
-from data_utils.filters.utils import sample_frames
+from filters import FILTER_REGISTRY, VideoFilter
+from filters.utils import sample_frames
 
 _ALL_FILTERS = list(FILTER_REGISTRY.keys())
 
