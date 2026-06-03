@@ -49,14 +49,22 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_min_timestep_boundary=0.0,
         e2e_max_timestep_boundary=1.0,
         e2e_sigma_shift=5.0,
+        e2e_algorithm="maml",
         e2e_first_order=False,
         outer_lr=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # Second-order meta-training needs double-backward-capable attention. FOMAML
-        # only ever does a single backward, so fused flash/sage kernels are fine.
-        if not e2e_first_order:
+        # Resolve the meta-learning algorithm. --e2e_first_order is a back-compat alias
+        # for FOMAML; --e2e_algorithm is the single source of truth otherwise.
+        algorithm = str(e2e_algorithm).lower()
+        if e2e_first_order and algorithm == "maml":
+            algorithm = "fomaml"
+        if algorithm not in ("maml", "fomaml", "reptile"):
+            raise ValueError(f"--e2e_algorithm must be maml|fomaml|reptile, got {algorithm!r}")
+        # Only exact second-order MAML needs double-backward-capable attention. FOMAML and
+        # Reptile each do a single backward per inner step, so fused flash/sage kernels are fine.
+        if algorithm == "maml":
             enable_double_backward_attention()
         # --- training-dynamics logging state ---
         # Previous-step LoRA snapshot, used to measure the *realized* per-step update
@@ -88,7 +96,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             min_timestep_boundary=float(e2e_min_timestep_boundary),
             max_timestep_boundary=float(e2e_max_timestep_boundary),
             optimizer=str(e2e_inner_optimizer),
-            first_order=bool(e2e_first_order),
+            algorithm=algorithm,
         )
         self.truncate_steps = [int(s) for s in str(e2e_truncate_steps).split(",") if s != ""]
         # Dedicated 1000-step training scheduler (does not touch any inference scheduler).
@@ -96,7 +104,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
               f"chunks={self.chunk_cfg.num_chunks} x {self.chunk_cfg.frames_per_chunk}f | "
               f"outer_lr={self.outer_lr} | "
-              f"order={'first (FOMAML)' if self.inner_cfg.first_order else 'second'} | "
+              f"algorithm={self.inner_cfg.algorithm} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
               f"steps={self.inner_cfg.num_gradient_steps} mc={self.inner_cfg.num_mc_samples} | "
               f"truncate_steps={self.truncate_steps}")
@@ -219,14 +227,18 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             truncate_steps=self.truncate_steps,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             write_back=False,
-            first_order=self.inner_cfg.first_order,
+            algorithm=self.inner_cfg.algorithm,
         )
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
         # `meta_loss` is logged separately as the generic "loss"; these add the MAML-specific
         # breakdown (all detached — they must never touch the second-order meta-graph).
         # train/meta_lr (the live outer LR) is added by ModelLogger via lr_log_key, not here.
+        # `meta_loss` is the scalar the runner back-propagates; for Reptile it is the
+        # pseudo-gradient surrogate (not a meaningful loss value), so log the algorithm's
+        # human-meaningful monitor loss instead (predict loss for MAML/FOMAML, memorize
+        # loss for Reptile). All detached -- they must never touch the meta-graph.
         self.log_metrics = {
-            "train/meta_loss": meta_loss.detach(),
+            "train/meta_loss": stats.get("monitor_loss", meta_loss.detach()),
             "train/memorize_loss": stats["memorize_loss"].detach() if torch.is_tensor(stats["memorize_loss"]) else stats["memorize_loss"],
             "train/num_pred_pairs": float(stats["num_pred"]),
             "train/num_mem_steps": float(stats["num_mem_steps"]),
@@ -259,9 +271,13 @@ def e2e_ttt_parser():
     g.add_argument("--e2e_min_timestep_boundary", type=float, default=0.0, help="Min timestep fraction for inner loss.")
     g.add_argument("--e2e_max_timestep_boundary", type=float, default=1.0, help="Max timestep fraction for inner loss.")
     g.add_argument("--e2e_sigma_shift", type=float, default=5.0, help="Flow-matching sigma shift for the TTT scheduler.")
+    g.add_argument("--e2e_algorithm", type=str, default="maml", choices=["maml", "fomaml", "reptile"],
+                   help="Meta-learning algorithm: maml (second-order), fomaml (first-order MAML), "
+                        "or reptile (SGD adaptation then move phi_0 toward the adapted weights). "
+                        "fomaml/reptile use a single backward (fused attention OK) and ignore "
+                        "--e2e_truncate_steps.")
     g.add_argument("--e2e_first_order", action="store_true",
-                   help="First-order MAML (FOMAML): drop the Hessian term. Frees the inner-loop "
-                        "graph, allows fused attention, and ignores --e2e_truncate_steps.")
+                   help="Back-compat alias for --e2e_algorithm fomaml (drop the Hessian term).")
     return parser
 
 
@@ -381,6 +397,7 @@ if __name__ == "__main__":
         e2e_min_timestep_boundary=args.e2e_min_timestep_boundary,
         e2e_max_timestep_boundary=args.e2e_max_timestep_boundary,
         e2e_sigma_shift=args.e2e_sigma_shift,
+        e2e_algorithm=args.e2e_algorithm,
         e2e_first_order=args.e2e_first_order,
         outer_lr=args.learning_rate,
     )

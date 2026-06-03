@@ -123,10 +123,31 @@ class InnerLoopConfig:
     optimizer: str = "sgd"  # one of: sgd, adamw, muon, muonclip
     # PERK-style meta-learned per-(param, step) learning rates (training only).
     meta_learn_lr: bool = False
-    # First-order MAML (FOMAML): drop the Hessian term from the meta-gradient
-    # (inner grads become constants, create_graph=False). Frees the inner-loss
-    # graph immediately and removes the double-backward attention requirement.
+    # Meta-learning algorithm (training only). One of:
+    #   * "maml"    - exact second-order MAML (create_graph=True; needs double-backward
+    #                 attention). Inner loop memorize chunk k -> predict chunk k+1.
+    #   * "fomaml"  - first-order MAML: drop the Hessian (create_graph=False). Same
+    #                 memorize->predict objective; grad reaches phi_0 only through the
+    #                 clone->phi_0 identity path. Frees the graph each step; fused
+    #                 attention OK; --e2e_truncate_steps is ignored.
+    #   * "reptile" - plain SGD adaptation on the memorize chunks, then move phi_0 toward
+    #                 the adapted weights. No predict term, no second-order graph.
+    algorithm: str = "maml"
+    # Back-compat alias: first_order=True selects FOMAML. Reconciled in __post_init__ so
+    # `algorithm` is always the single source of truth; `first_order` ends up True for
+    # any non-second-order algorithm (fomaml/reptile) for code/logs that still read it.
     first_order: bool = False
+
+    def __post_init__(self):
+        self.algorithm = str(self.algorithm).lower()
+        if self.first_order and self.algorithm == "maml":
+            self.algorithm = "fomaml"
+        if self.algorithm not in ("maml", "fomaml", "reptile"):
+            raise ValueError(
+                f"InnerLoopConfig.algorithm must be one of maml|fomaml|reptile, "
+                f"got {self.algorithm!r}"
+            )
+        self.first_order = self.algorithm != "maml"
 
 
 @dataclass
@@ -594,8 +615,126 @@ def compute_flow_matching_loss(
 
 
 # --------------------------------------------------------------------------- #
-# Meta-training inner loop (second-order, memorize->predict)                  #
+# Meta-training inner loop (memorize->predict for MAML/FOMAML; SGD for Reptile)#
 # --------------------------------------------------------------------------- #
+
+
+def _inner_adapt_stats(base_params, final_lora, lora_names, device):
+    """Inner adaptation magnitude for the last task: how far the inner loop moved the
+    LoRA scratchpad from phi_0 (||phi_adapted - phi_0|| and the same / ||phi_0||).
+    Fully detached -- a pure diagnostic, never part of the meta-graph."""
+    out = {}
+    if final_lora is None:
+        return out
+    with torch.no_grad():
+        delta_sq = torch.zeros((), device=device)
+        phi0_sq = torch.zeros((), device=device)
+        for n in lora_names:
+            phi0 = base_params[n].detach()
+            delta_sq = delta_sq + (final_lora[n].detach() - phi0).pow(2).sum()
+            phi0_sq = phi0_sq + phi0.pow(2).sum()
+        inner_delta = delta_sq.sqrt()
+        out["inner_adapt_norm"] = inner_delta
+        out["inner_adapt_ratio"] = inner_delta / (phi0_sq.sqrt() + 1e-8)
+    return out
+
+
+def _run_reptile_inner_loop(
+    pipe,
+    scheduler: FlowMatchScheduler,
+    video_chunks: List[List[torch.Tensor]],
+    video_contexts: List[torch.Tensor],
+    inner_cfg: InnerLoopConfig,
+    *,
+    learned_lrs: Optional[MetaLearnedLRSchedule] = None,
+    use_gradient_checkpointing: bool = False,
+    write_back: bool = False,
+):
+    """Reptile meta-update.
+
+    Adapt phi_0 -> phi_K with plain (non-differentiable) SGD on the *same* memorize
+    chunks MAML uses (chunks 0..N-2), then move phi_0 toward the adapted weights. The
+    Reptile pseudo-gradient ``g = phi_0 - phi_K`` (averaged over the videos in the
+    batch) is deposited onto the real phi_0 LoRA leaves through a surrogate scalar
+    whose gradient w.r.t. phi_0 equals ``g``::
+
+        surrogate = sum_n < phi_0[n], (phi_0[n] - phi_K[n]).detach() >
+        d surrogate / d phi_0[n] = (phi_0[n] - phi_K[n]) = g[n]
+
+    So the unmodified outer loop (``meta_loss.backward()`` -> outer optimizer step)
+    applies the Reptile update with no special-casing in the runner. There is no
+    predict term and no second-order graph: every inner step is a single first-order
+    backward, so fused attention is fine (no double-backward requirement)."""
+    dit = pipe.dit
+    base_params = dict(dit.named_parameters())
+    lora_names = [n for n in base_params if "lora" in n and base_params[n].requires_grad]
+    if not lora_names:
+        raise ValueError("No trainable LoRA parameters found on pipe.dit. Inject LoRA first.")
+
+    device = pipe.device
+    opt = make_inner_optimizer(inner_cfg)
+
+    mem_loss_sum = torch.zeros((), device=device)
+    mem_count = 0
+    mem_step_idx = 0
+    num_tasks = 0
+    pseudo = {n: torch.zeros_like(base_params[n]) for n in lora_names}
+    final_lora: Optional[Dict[str, torch.Tensor]] = None
+
+    def _resolve_lrs(step_idx: int):
+        return None if learned_lrs is None else learned_lrs.get_lrs(step_idx)
+
+    for chunks, ctx in zip(video_chunks, video_contexts):
+        if len(chunks) < 2:
+            continue  # match MAML/FOMAML: need >=2 chunks to define the memorize set
+        # Detached scratchpad initialised at phi_0; a leaf so autograd.grad can target it.
+        current = {n: base_params[n].detach().clone().requires_grad_(True) for n in lora_names}
+        for k in range(len(chunks) - 1):  # memorize chunks 0..N-2 (MAML's inner-loop set)
+            for _ in range(max(1, int(inner_cfg.num_gradient_steps))):
+                loss_mem = compute_flow_matching_loss(
+                    pipe, scheduler, chunks[k], ctx, inner_cfg,
+                    params_override={**current},
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                )
+                mem_loss_sum = mem_loss_sum + loss_mem.detach()
+                mem_count += 1
+                # First-order grad only (no create_graph): ordinary SGD adaptation.
+                grads_list = torch.autograd.grad(
+                    loss_mem, [current[n] for n in lora_names], allow_unused=True,
+                )
+                grads = {n: g for n, g in zip(lora_names, grads_list)}
+                updated = opt.step(current, grads, learned_lrs=_resolve_lrs(mem_step_idx))
+                # Detach + re-leaf so the next step differentiates w.r.t. the new weights only.
+                current = {n: updated[n].detach().requires_grad_(True) for n in lora_names}
+                mem_step_idx += 1
+        with torch.no_grad():
+            for n in lora_names:
+                pseudo[n] = pseudo[n] + (base_params[n].detach() - current[n].detach())
+        final_lora = current
+        num_tasks += 1
+
+    if num_tasks == 0:
+        raise ValueError("No Reptile tasks produced; need >=2 chunks per video. Check chunking config.")
+
+    if write_back and final_lora is not None:
+        with torch.no_grad():
+            for n, v in final_lora.items():
+                base_params[n].copy_(v.detach())
+
+    # Surrogate whose grad w.r.t. phi_0 equals the mean Reptile pseudo-gradient (phi_0-phi_K).
+    meta_loss = torch.zeros((), device=device)
+    for n in lora_names:
+        meta_loss = meta_loss + (base_params[n].float() * (pseudo[n] / num_tasks).float()).sum()
+
+    mem_mean = (mem_loss_sum / mem_count) if mem_count else mem_loss_sum
+    stats = {
+        "memorize_loss": mem_mean,
+        "monitor_loss": mem_mean,   # no predict term in Reptile; track the memorize fit
+        "num_pred": 0,
+        "num_mem_steps": mem_count,
+    }
+    stats.update(_inner_adapt_stats(base_params, final_lora, lora_names, device))
+    return meta_loss, stats
 
 
 def run_meta_inner_loop(
@@ -609,9 +748,9 @@ def run_meta_inner_loop(
     learned_lrs: Optional[MetaLearnedLRSchedule] = None,
     use_gradient_checkpointing: bool = False,
     write_back: bool = False,
-    first_order: bool = False,
+    algorithm: Optional[str] = None,
 ):
-    """Differentiable memorize->predict MAML inner loop over chunk sequences.
+    """Memorize->predict inner loop over chunk sequences (MAML / FOMAML / Reptile).
 
     For each video, starting from the LoRA meta-init phi_0 (a fresh clone of the real
     parameters, keeping the graph connected to phi_0):
@@ -623,9 +762,20 @@ def run_meta_inner_loop(
     Returns ``(meta_loss, stats)``. ``meta_loss.backward()`` populates grads on the
     real LoRA leaves (phi_0); with ``write_back=False`` the real leaves are never
     mutated, so the outer optimizer updates phi_0 directly. By default the meta-loss
-    is second-order (create_graph=True). With ``first_order=True`` (FOMAML) the inner
-    grads are detached, dropping the Hessian term and the double-backward requirement.
+    is second-order (create_graph=True). With FOMAML the inner grads are detached,
+    dropping the Hessian term and the double-backward requirement. ``algorithm`` selects
+    the variant (defaults to ``inner_cfg.algorithm``); ``algorithm="reptile"`` dispatches
+    to the SGD-then-interpolate Reptile path (no predict term, no second-order graph).
     """
+    algorithm = (algorithm or getattr(inner_cfg, "algorithm", "maml")).lower()
+    if algorithm == "reptile":
+        return _run_reptile_inner_loop(
+            pipe, scheduler, video_chunks, video_contexts, inner_cfg,
+            learned_lrs=learned_lrs,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            write_back=write_back,
+        )
+    first_order = algorithm != "maml"  # FOMAML drops the Hessian
     truncate_steps = truncate_steps or []
     if first_order and truncate_steps:
         # FOMAML keeps phi connected to phi_0 only through the clone+update identity
@@ -678,6 +828,7 @@ def run_meta_inner_loop(
                 # create_graph=False detaches grads (and frees the inner-loss graph,
                 # since retain_graph defaults to create_graph), leaving phi connected
                 # to phi_0 only via the clone+update identity path.
+                # TODO: add checkpoint gradient here.
                 grads_list = torch.autograd.grad(
                     loss_mem, [current_lora[n] for n in lora_names],
                     create_graph=not first_order, allow_unused=True,
@@ -708,27 +859,15 @@ def run_meta_inner_loop(
             for n, v in final_lora.items():
                 base_params[n].copy_(v.detach())
 
+    meta_loss = meta_loss / num_pred
     stats = {
         "memorize_loss": (mem_loss_sum / mem_count) if mem_count else mem_loss_sum,
+        "monitor_loss": meta_loss.detach(),  # mean next-chunk predict loss
         "num_pred": num_pred,
         "num_mem_steps": mem_count,
     }
-    # Inner adaptation magnitude: how far the inner loop moved the LoRA "scratchpad"
-    # away from the meta-init phi_0 for the last video (||phi_adapted - phi_0||, and the
-    # same normalised by ||phi_0||). Fully detached so it never enters the meta-graph;
-    # it measures whether the TTT memory mechanism is actually adapting per video.
-    if final_lora is not None:
-        with torch.no_grad():
-            delta_sq = torch.zeros((), device=device)
-            phi0_sq = torch.zeros((), device=device)
-            for n in lora_names:
-                phi0 = base_params[n].detach()
-                delta_sq = delta_sq + (final_lora[n].detach() - phi0).pow(2).sum()
-                phi0_sq = phi0_sq + phi0.pow(2).sum()
-            inner_delta = delta_sq.sqrt()
-            stats["inner_adapt_norm"] = inner_delta
-            stats["inner_adapt_ratio"] = inner_delta / (phi0_sq.sqrt() + 1e-8)
-    return meta_loss / num_pred, stats
+    stats.update(_inner_adapt_stats(base_params, final_lora, lora_names, device))
+    return meta_loss, stats
 
 
 # --------------------------------------------------------------------------- #
