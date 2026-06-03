@@ -34,7 +34,7 @@ model:
 train:
   learning_rate: 1.0e-5
   num_epochs: 1
-  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_smoke
+  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_fomaml_smoke
   remove_prefix_in_ckpt: pipe.dit.
   # Activation checkpointing is carried through the recompute by the override path
   # (see _override_checkpointed_blocks). Without it the memorize + predict forwards
