@@ -78,9 +78,9 @@ def add_logger_config(parser: argparse.ArgumentParser):
     parser.add_argument("--enable_swanlab_log", default=False, action="store_true", help="Enable swanlab for logging.")
     parser.add_argument("--swanlab_project", type=str, default="DiffSynth-Studio", help="SwanLab project name.")
     parser.add_argument("--enable_wandb_log", default=False, action="store_true", help="Enable wandb for logging.")
-    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "ttt-imagine-diffsynth"), help="Wandb (and swanlab) project name. Defaults to $WANDB_PROJECT or 'ttt-imagine-diffsynth'.")
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "E2E-TTT"), help="Wandb (and swanlab) project name. Defaults to $WANDB_PROJECT or 'E2E-TTT'.")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="Wandb/swanlab run name. Defaults to the output_path basename.")
-    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (team/user). Defaults to the logged-in default.")
+    parser.add_argument("--wandb_entity", type=str, default=os.environ.get("WANDB_ENTITY", "ttt-imagine"), help="Wandb entity (team/org/user). Defaults to $WANDB_ENTITY or the 'ttt-imagine' org.")
     return parser
 
 def add_general_config(parser: argparse.ArgumentParser):
