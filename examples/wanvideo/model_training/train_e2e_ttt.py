@@ -234,11 +234,13 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         # breakdown (all detached — they must never touch the second-order meta-graph).
         # train/meta_lr (the live outer LR) is added by ModelLogger via lr_log_key, not here.
         # `meta_loss` is the scalar the runner back-propagates; for Reptile it is the
-        # pseudo-gradient surrogate (not a meaningful loss value), so log the algorithm's
-        # human-meaningful monitor loss instead (predict loss for MAML/FOMAML, memorize
-        # loss for Reptile). All detached -- they must never touch the meta-graph.
+        # pseudo-gradient surrogate (an arbitrary inner-product value, not a meaningful
+        # loss), so log train/meta_loss as 0 -- Reptile has no meta-objective, and the
+        # memorize fit is already surfaced separately as train/memorize_loss. MAML/FOMAML
+        # log their real predict loss. All detached -- never touch the meta-graph.
+        is_reptile = str(getattr(self.inner_cfg, "algorithm", "maml")).lower() == "reptile"
         self.log_metrics = {
-            "train/meta_loss": stats.get("monitor_loss", meta_loss.detach()),
+            "train/meta_loss": 0.0 if is_reptile else stats.get("monitor_loss", meta_loss.detach()),
             "train/memorize_loss": stats["memorize_loss"].detach() if torch.is_tensor(stats["memorize_loss"]) else stats["memorize_loss"],
             "train/num_pred_pairs": float(stats["num_pred"]),
             "train/num_mem_steps": float(stats["num_mem_steps"]),
