@@ -350,6 +350,26 @@ if __name__ == "__main__":
     args.output_path = f"{os.path.normpath(args.output_path)}-{run_stamp[0]}"
     if accelerator.is_main_process:
         print(f"[E2E-TTT] Run outputs -> {args.output_path}")
+    # Spatial alignment divisor = VAE spatial compression x DiT patch size (2).
+    # The Wan2.1 VAE is 8x (-> divisor 16); the Wan2.2 VAE shipped with TI2V-5B is
+    # 16x (-> divisor 32). A frame whose height is a multiple of 16 but not 32 (e.g.
+    # 720) yields an odd latent height (45) under the 16x VAE, and the DiT patchify
+    # (stride-2 conv) silently floors it to 44 -> target/noise_pred size mismatch.
+    _paths_str = str(args.model_paths) + str(getattr(args, "tokenizer_path", ""))
+    _is_wan22 = "Wan2.2" in _paths_str or "TI2V-5B" in _paths_str
+    _spatial_div = 32 if _is_wan22 else 16
+    # ImageCropAndResize only snaps to the division factor when height/width are left
+    # unset; with explicit sizes (our case) it crops verbatim. So snap them here too,
+    # otherwise an explicit 720 stays 720 and re-triggers the odd-latent mismatch.
+    _aligned_h = args.height // _spatial_div * _spatial_div
+    _aligned_w = args.width // _spatial_div * _spatial_div
+    if accelerator.is_main_process:
+        _vae_desc = "Wan2.2 VAE 16x" if _is_wan22 else "Wan2.1 VAE 8x"
+        print(f"[E2E-TTT] spatial division factor = {_spatial_div} ({_vae_desc})")
+        if (_aligned_h, _aligned_w) != (args.height, args.width):
+            print(f"[E2E-TTT] snapped frame size {args.height}x{args.width} -> "
+                  f"{_aligned_h}x{_aligned_w} to align with the DiT patch grid")
+    args.height, args.width = _aligned_h, _aligned_w
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -360,8 +380,8 @@ if __name__ == "__main__":
             max_pixels=args.max_pixels,
             height=args.height,
             width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
+            height_division_factor=_spatial_div,
+            width_division_factor=_spatial_div,
             num_frames=args.num_frames,
             time_division_factor=4,
             time_division_remainder=1,
