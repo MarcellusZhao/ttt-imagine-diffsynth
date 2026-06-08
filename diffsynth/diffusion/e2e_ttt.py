@@ -179,6 +179,13 @@ class InferenceConfig:
     cfg_scale: float = 5.0
     seed: int = 42
     tiled: bool = True
+    # Autoregressive frame conditioning: condition each chunk on the last frame of
+    # the previous one (via TI2V-5B's fused VAE first-frame latent). Complements the
+    # LoRA memory scratchpad with an explicit pixel-space anchor. TI2V-5B only.
+    condition_on_last_frame: bool = False
+    # When conditioning on the last frame, the first frame of each follow-up chunk
+    # reproduces that anchor frame; drop it to avoid a duplicate-frame seam.
+    drop_boundary_frame: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -1034,6 +1041,9 @@ class WanE2ETTTSequentialGenerator:
         restore_lora_state(self.pipe.dit, self.phi0)
 
         all_frames = []
+        # Running image anchor for autoregressive frame conditioning. Seeded with the
+        # optional I2V image; refreshed to the last generated frame after each chunk.
+        cond_image = input_image
         for k in range(icfg.num_chunks):
             call_kwargs = dict(
                 prompt=prompt,
@@ -1047,14 +1057,26 @@ class WanE2ETTTSequentialGenerator:
                 tiled=icfg.tiled,
                 seed=seed + k,
             )
-            # First chunk of an I2V (TI2V-5B) narrative can be image-conditioned.
-            if input_image is not None and k == 0:
-                call_kwargs["input_image"] = input_image
+            # Image-condition this chunk (TI2V-5B fused first-frame latent):
+            #   - k == 0: the optional I2V seed image, if any;
+            #   - k  > 0: the last frame of the previous chunk, when enabled.
+            if cond_image is not None and (k == 0 or icfg.condition_on_last_frame):
+                call_kwargs["input_image"] = cond_image
             call_kwargs.update(extra_call_kwargs)
 
             frames = self.pipe(**call_kwargs)
-            all_frames.extend(frames)
-            print(f"[E2E-TTT] generated chunk {k + 1}/{icfg.num_chunks} ({len(frames)} frames)")
+            # The first frame of a follow-up chunk reproduces the anchor frame; drop it
+            # to avoid a duplicate-frame seam at the chunk boundary.
+            if k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
+                emitted = frames[1:]
+            else:
+                emitted = frames
+            all_frames.extend(emitted)
+            # Carry the last frame forward as the next chunk's anchor.
+            if icfg.condition_on_last_frame and len(frames) > 0:
+                cond_image = frames[-1]
+            print(f"[E2E-TTT] generated chunk {k + 1}/{icfg.num_chunks} "
+                  f"({len(emitted)} frames)")
 
             if k == icfg.num_chunks - 1:
                 continue
