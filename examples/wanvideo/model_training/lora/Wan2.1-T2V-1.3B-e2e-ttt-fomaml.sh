@@ -9,6 +9,7 @@
 set -e
 
 CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt-fomaml-smoke.yaml}"
+# CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt-fomaml.yaml}"
 
 # FOMAML's single-backward path uses far less memory than the second-order meta-backward,
 # but keep expandable_segments on to avoid allocator fragmentation stranding reserved VRAM.

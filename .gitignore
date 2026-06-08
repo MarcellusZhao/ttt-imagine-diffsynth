@@ -16,6 +16,7 @@
 log*.txt
 AGENTS.md
 *.mp4
+*.sbatch
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
