@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FOMAML (first-order) E2E-TTT meta-training config for Wan2.1-T2V-14B.
+#
+# Run with:
+#   bash examples/wanvideo/model_training/lora/Wan2.1-T2V-14B-e2e-ttt-fomaml.sh
+#   accelerate launch examples/wanvideo/model_training/train_e2e_ttt.py \
+#       --config examples/wanvideo/model_training/configs/Wan2.1-T2V-14B-e2e-ttt-fomaml.yaml
+#
+# Same memorize→predict meta-objective as the 1.3B/5B fomaml configs, just the
+# 14B DiT. `e2e_first_order: true` drops the Hessian term: the inner-loop graph is
+# freed each step, fused flash/sage attention is allowed (NO math-SDPA pin), and
+# `e2e_truncate_steps` is ignored. Single-backward only, so it is much lighter than
+# the second-order MAML path — which is why 14B is even attempted here.
+#
+# Memory notes (14B is the heavy variant — develop on 1.3B/5B first):
+#   * The 14B DiT is sharded across SIX safetensors files — passed as a NESTED list
+#     so they load as a single DiT ModelConfig (mirrors the inference sorted(glob)).
+#   * train_e2e_ttt._encode moves the VAE + umt5-xxl text encoder to CPU after the
+#     (detached) encode, so during the FOMAML backward only the ~28 GB DiT is GPU-
+#     resident — do NOT add --enable_model_cpu_offload (its OffloadTrainingManager
+#     streams the trainable DiT and hooks after_backward, which the differentiable
+#     LoRA-override path does not expect). Frozen-model offload is already handled.
+#   * use_gradient_checkpointing is carried through the override-path recompute
+#     (_override_checkpointed_blocks), so it is safe AND necessary here — without it
+#     all 40 DiT blocks retain activations and OOM. Keep it on.
+#   * Resolution is conservative at 480x832 (the canonical 14B training size, ~÷16 →
+#     far fewer tokens than 720x1280, so ~quadratically less attention memory). Bump
+#     to 720x1280 only if the run lands with headroom. On OOM, lower height/width or
+#     drop e2e_num_chunks to 2 (one memorize→predict pair).
+# ─────────────────────────────────────────────────────────────────────────────
+
+dataset:
+  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/train_diffsynth_merged.csv
+  dataset_repeat: 1
+  height: 720 # [480, 720]
+  width: 1280  # [832, 1280]
+  num_frames: 196              # first 196 frames are used (4 chunks * 49)
+  frame_rate: 16
+
+model:
+  model_paths:
+    - - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/Wan2.1_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-14B/google/umt5-xxl
+
+train:
+  learning_rate: 1.0e-5
+  num_epochs: 1
+  output_path: ./models/train/Wan2.1-T2V-14B_e2e_ttt_fomaml
+  remove_prefix_in_ckpt: pipe.dit.
+  use_gradient_checkpointing: true
+
+lora:
+  lora_base_model: dit
+  lora_target_modules: [q, k, v, o, ffn.0, ffn.2]
+  lora_rank: 32
+
+# Weights & Biases monitoring. Offline by default (safe on air-gapped compute
+# nodes) — runs land in <output_path>/wandb_log; `export WANDB_MODE=online` to
+# stream live, or `disabled` to turn off without editing this file. The run name
+# defaults to the output_path basename. All metrics are logged under the wandb
+# "train" group each step: train/meta_loss, train/memorize_loss,
+# train/num_pred_pairs, train/num_mem_steps, train/inner_lr, and train/meta_lr
+# (the live outer-loop LR).
+logger:
+  enable_wandb_log: true
+  wandb_project: E2E-TTT
+
+e2e_ttt:
+  e2e_num_chunks: 3 # [2, 4, 6, 8]
+  e2e_frames_per_chunk: 49 # [13, 25, 37, 49]
+  e2e_num_gradient_steps: 1
+  e2e_num_mc_samples: 1
+  e2e_inner_lr: 1.0e-4
+  e2e_max_inner_grad_norm: 1.0
+  e2e_inner_optimizer: sgd
+  e2e_truncate_steps: []
+  e2e_sigma_shift: 5.0
+  e2e_first_order: true         # FOMAML: drop the Hessian term

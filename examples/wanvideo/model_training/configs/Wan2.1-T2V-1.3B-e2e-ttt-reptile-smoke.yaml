@@ -37,7 +37,7 @@ model:
   tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B/google/umt5-xxl
 
 train:
-  learning_rate: 1.0e-5
+  learning_rate: 5.0e-3
   num_epochs: 1
   output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_reptile_smoke
   remove_prefix_in_ckpt: pipe.dit.
@@ -57,14 +57,14 @@ lora:
 # train/inner_lr, train/meta_lr (live outer LR), and lora/inner_adapt_{norm,ratio}.
 logger:
   enable_wandb_log: true
-  wandb_project: ttt-imagine-diffsynth
+  wandb_project: E2E-TTT
 
 e2e_ttt:
   e2e_num_chunks: 2
   e2e_frames_per_chunk: 13
   e2e_num_gradient_steps: 1
   e2e_num_mc_samples: 1
-  e2e_inner_lr: 5.0e-5
+  e2e_inner_lr: 1.0e-4
   e2e_max_inner_grad_norm: 1.0
   e2e_inner_optimizer: sgd
   e2e_truncate_steps: []
