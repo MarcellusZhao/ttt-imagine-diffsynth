@@ -13,11 +13,11 @@
 
 dataset:
   dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
-  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/train_diffsynth_merged.csv
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ttt_imagine_10k.csv
   dataset_repeat: 1
   height: 720 # [352, 720]
   width: 1280 # [512, 1280]
-  num_frames: 196
+  num_frames: 164
   frame_rate: 16
 
 model:
@@ -54,7 +54,7 @@ logger:
 
 e2e_ttt:
   e2e_num_chunks: 4 # [2, 4, 6, 8]
-  e2e_frames_per_chunk: 49 # [13, 25, 37, 49]
+  e2e_frames_per_chunk: 41 # [13, 25, 37, 49]
   e2e_num_gradient_steps: 1 
   e2e_num_mc_samples: 1
   e2e_inner_lr: 1.0e-4

@@ -13,15 +13,15 @@
 
 dataset:
   dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
-  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/train_diffsynth_merged.csv
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ttt_imagine_10k.csv
   dataset_repeat: 1
   # 352x512 (÷16) → ~2,816 DiT tokens/chunk vs ~3,456 at 384x576 → ~0.66x the
   # O(seq²) attention memory. FOMAML's single-backward path uses far less memory
   # than the second-order double-backward, so there is more headroom here; bump the
   # resolution back up if you want.
-  height: 720 # [352, 720]
-  width: 1280 # [512, 1280]
-  num_frames: 196              # first 196 frames are used (4 chunks * 49)
+  height: 352 # [352, 720]
+  width: 512 # [512, 1280]
+  num_frames: 164              # first 164 frames are used (4 chunks * 41)
   frame_rate: 16
 
 model:
@@ -34,7 +34,7 @@ model:
 train:
   learning_rate: 1.0e-5
   num_epochs: 1
-  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_fomaml
+  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_fomaml_imagine_10k
   remove_prefix_in_ckpt: pipe.dit.
   # Activation checkpointing is carried through the recompute by the override path
   # (see _override_checkpointed_blocks). Without it the memorize + predict forwards
@@ -59,7 +59,7 @@ logger:
 
 e2e_ttt:
   e2e_num_chunks: 4 # [2, 4, 6, 8]
-  e2e_frames_per_chunk: 49 # [13, 25, 37, 49]
+  e2e_frames_per_chunk: 41 # [13, 25, 37, 49]
   e2e_num_gradient_steps: 1
   e2e_num_mc_samples: 1
   e2e_inner_lr: 1.0e-4

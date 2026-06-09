@@ -10,7 +10,7 @@
 #   ... --config <other.yaml>            # or point at the smoke config
 set -e
 
-CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt-reptile-smoke.yaml}"
+CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-T2V-1.3B-e2e-ttt-reptile.yaml}"
 
 # Reptile's single first-order backward uses the least memory of the three variants, but
 # keep expandable_segments on to avoid allocator fragmentation stranding reserved VRAM.

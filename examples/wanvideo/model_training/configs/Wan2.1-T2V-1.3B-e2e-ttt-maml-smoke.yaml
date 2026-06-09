@@ -12,7 +12,7 @@
 
 dataset:
   dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
-  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/train_diffsynth_merged.csv
+  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ttt_imagine_10k.csv
   dataset_repeat: 1
   # 352x512 (÷16) → ~2,816 DiT tokens/chunk vs ~3,456 at 384x576 → ~0.66x the
   # O(seq²) attention memory. The exact second-order double-backward parks near the
@@ -34,7 +34,7 @@ model:
 train:
   learning_rate: 1.0e-5
   num_epochs: 1
-  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_maml_smoke
+  output_path: ./models/train/Wan2.1-T2V-1.3B_e2e_ttt_maml_smoke_imagine_10k
   remove_prefix_in_ckpt: pipe.dit.
   # Activation checkpointing is carried through the second-order recompute by the
   # override path (see _override_checkpointed_blocks). Without it the memorize +
