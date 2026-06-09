@@ -28,15 +28,28 @@ def main():
         default="train_diffsynth.csv",
         help="Name of the per-dataset CSV file to merge.",
     )
+    parser.add_argument(
+        "--output-name",
+        default="train_diffsynth_merged.csv",
+        help="Name of the output CSV file.",
+    )
+    parser.add_argument(
+        "--data-size",
+        default=10000,
+        type=int,
+        help="Size of the dataset.",
+    )
     args = parser.parse_args()
 
-    output = os.path.join(args.base_dir, "train_diffsynth_merged.csv")
+    output = os.path.join(args.base_dir, args.output_name)
 
     total_rows = 0
     with open(output, "w", newline="") as fout:
         writer = csv.writer(fout)
         writer.writerow(["video", "prompt"])
-
+        data_size = args.data_size
+        overall_count = 0
+        print(f"Merging {data_size} rows from {len(args.datasets)} dataset(s) -> {output}")
         for dataset in args.datasets:
             csv_path = os.path.join(args.base_dir, dataset, args.csv_name)
             if not os.path.isfile(csv_path):
@@ -52,6 +65,9 @@ def main():
                         continue
                     writer.writerow(row)
                     count += 1
+                    overall_count += 1
+                    if overall_count >= data_size:
+                        break
             print(f"[OK] {dataset}: {count} rows")
             total_rows += count
 
