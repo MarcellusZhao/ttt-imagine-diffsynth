@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# VBench prompt-suite inference config for Wan2.2-TI2V-5B (text-to-video mode).
+#
+# Run with:
+#   python examples/wanvideo/model_inference/Wan2.2-TI2V-5B-vbench.py \
+#       --config examples/wanvideo/model_inference/configs/Wan2.2-TI2V-5B-vbench.yaml
+#
+# As with the training configs, sections are for readability only — just the leaf
+# keys matter, and they must match the script's argparse dest names. Anything on
+# the CLI overrides the YAML, so you can keep one config and pass --dimension /
+# --start_index / --end_index / --skip_existing per process when sharding.
+#
+# The 5B DiT is sharded across 3 safetensors files — passed as a NESTED list so
+# they load as a single DiT ModelConfig (same as the inference script's
+# sorted(glob(...)) fallback). native 720p (704x1248, 121 frames).
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_paths:
+    - - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/google/umt5-xxl
+  device: cuda
+
+vbench:
+  vbench_root: /home/hzhao/VBench
+  dimension: all                 # or a single dimension, e.g. object_class / temporal_flickering
+  num_videos_per_prompt: 1       # null -> 5, auto-25 when dimension == temporal_flickering
+  base_seed: 0                   # seed for clip i is base_seed + i (reproducible, distinct)
+
+generation:
+  height: 720
+  width: 1280
+  num_frames: 161                # 4n+1 for the Wan temporal VAE
+  num_inference_steps: 50
+  cfg_scale: 5.0
+  negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+output:
+  save_path: ./results/vbench/Wan2.2-TI2V-5B
+  fps: 16
+  quality: 5

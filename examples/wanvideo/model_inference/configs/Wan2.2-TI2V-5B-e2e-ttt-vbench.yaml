@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E-TTT VBench inference config for Wan2.2-TI2V-5B.
+#
+# Run with:
+#   python examples/wanvideo/model_inference/Wan2.2-TI2V-5B-e2e-ttt-vbench.py \
+#       --config examples/wanvideo/model_inference/configs/Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml
+#
+# Sections are for readability only — just the leaf keys matter, and they must match
+# the script's argparse dest names. CLI flags override the YAML, so you can pass
+# --dimension / --start_index / --end_index / --skip_existing per process when sharding.
+#
+# Point `lora` at a meta-trained phi_0 checkpoint and set `algorithm` to the variant
+# that produced it (maml/fomaml/reptile). A non-existent lora path falls back to a
+# zero-init identity adapter (still adapts at test time). Each VBench clip is
+# num_chunks * frames_per_chunk frames long, generated chunk-by-chunk with test-time
+# training; the scratchpad is reset to phi_0 before every clip. On top of the LoRA
+# memory, TI2V-5B anchors each chunk on the previous chunk's last frame.
+#
+# The 5B DiT is sharded across 3 safetensors files — passed as a NESTED list so they
+# load as a single DiT ModelConfig.
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_paths:
+    - - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/google/umt5-xxl
+  device: cuda
+
+lora:
+  # Path to the meta-trained phi_0 checkpoint produced by
+  # model_training/lora/Wan2.2-TI2V-5B-e2e-ttt.sh (MAML). Update to the run you want.
+  lora: /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors
+  algorithm: fomaml                # maml / fomaml / reptile (provenance of the checkpoint)
+  lora_rank: 32
+  target_modules: [q, k, v, o, ffn.0, ffn.2]
+
+inner_loop:
+  num_gradient_steps: 1
+  num_mc_samples: 1
+  inner_lr_init: 1.0e-4
+  max_inner_grad_norm: 1.0
+
+vbench:
+  vbench_root: /home/hzhao/VBench
+  dimension: all                 # or a single dimension, e.g. object_class / temporal_flickering
+  num_videos_per_prompt: 1       # null -> 5, auto-25 when dimension == temporal_flickering
+  base_seed: 0                   # clip i uses chunk seeds base_seed + i*num_chunks + k
+
+chunking:
+  num_chunks: 4                  # contiguous sub-clips generated sequentially per VBench clip
+  frames_per_chunk: 41           # 4n+1 for the Wan temporal VAE
+  ttt_steps_per_chunk: 1         # test-time training steps applied per chunk
+  condition_on_last_frame: true  # anchor each chunk on the previous chunk's last frame (TI2V-5B)
+  drop_boundary_frame: true      # drop the duplicated anchor frame at each chunk boundary
+
+generation:
+  height: 720
+  width: 1280
+  num_inference_steps: 50
+  cfg_scale: 5.0
+  sigma_shift: 5.0
+  negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+output:
+  save_path: ./results/vbench/Wan2.2-TI2V-5B-e2e-ttt-maml
+  fps: 16
+  quality: 5
