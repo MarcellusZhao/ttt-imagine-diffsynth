@@ -15,14 +15,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="${CONFIG:-$SCRIPT_DIR/configs/Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml}"
-SAVE_PATH="${SAVE_PATH:-/home/hzhao/ttt-imagine-diffsynth/results/vbench/Wan2.2-TI2V-5B-e2e-ttt-fomaml-with-conditioning}"
+CONFIG="${CONFIG:-$SCRIPT_DIR/../configs/Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml}"
+SAVE_PATH="${SAVE_PATH:-/home/hzhao/ttt-imagine-diffsynth/results/vbench/Wan2.2-TI2V-5B-e2e-ttt-fomaml-with-conditioning-10k}"
 
 # 1) All dimensions: 1 video per prompt.
 python "$SCRIPT_DIR/Wan2.2-TI2V-5B-e2e-ttt-vbench.py" \
     --config "$CONFIG" \
     --algorithm fomaml \
-    --lora /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors \
+    --lora /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260608-211316/epoch-0.safetensors \
     --dimension all \
     --save_path "$SAVE_PATH" \
     --num_videos_per_prompt 1 \
@@ -32,7 +32,7 @@ python "$SCRIPT_DIR/Wan2.2-TI2V-5B-e2e-ttt-vbench.py" \
 python "$SCRIPT_DIR/Wan2.2-TI2V-5B-e2e-ttt-vbench.py" \
     --config "$CONFIG" \
     --algorithm fomaml \
-    --lora /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors \
+    --lora /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260608-211316/epoch-0.safetensors \
     --dimension temporal_flickering \
     --save_path "$SAVE_PATH" \
     --num_videos_per_prompt 5 \

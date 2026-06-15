@@ -33,7 +33,7 @@ model:
 lora:
   # Path to the meta-trained phi_0 checkpoint produced by
   # model_training/lora/Wan2.2-TI2V-5B-e2e-ttt.sh (MAML). Update to the run you want.
-  lora: /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors
+  # lora: /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors
   algorithm: fomaml                # maml / fomaml / reptile (provenance of the checkpoint)
   lora_rank: 32
   target_modules: [q, k, v, o, ffn.0, ffn.2]

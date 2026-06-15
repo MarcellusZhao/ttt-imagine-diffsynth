@@ -113,6 +113,8 @@ def parse_args():
     # Output
     parser.add_argument("--save_path", type=str, required=True,
                         help="Directory for sampled clips, named <prompt>-<index>.mp4.")
+    parser.add_argument("--output_name", type=str, required=True,
+                        help="Output video name.")
     parser.add_argument("--fps", type=int, default=24, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
 
