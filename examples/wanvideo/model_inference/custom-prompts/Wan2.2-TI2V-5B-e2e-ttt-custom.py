@@ -15,6 +15,7 @@ Point --lora at a meta-trained LoRA phi_0 checkpoint (from
 import argparse
 import glob
 import os
+import time
 
 import torch
 from PIL import Image
@@ -25,8 +26,8 @@ from diffsynth.diffusion.e2e_ttt import (
 )
 
 
-DEFAULT_PROMPT = "两只可爱的橘猫戴上拳击手套，站在一个拳击台上搏斗。"
-DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+# DEFAULT_PROMPT = "两只可爱的橘猫戴上拳击手套，站在一个拳击台上搏斗。"
+# DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 DEFAULT_MODEL_DIR = "/work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B"
 
 
@@ -42,9 +43,9 @@ def parse_args():
                         help="Device to load the pipeline on.")
 
     # Prompts
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT,
+    parser.add_argument("--prompt", type=str, required=True,
                         help="Text prompt describing the video to generate.")
-    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
+    parser.add_argument("--negative_prompt", type=str, required=True,
                         help="Negative prompt.")
 
     # LoRA "memory scratchpad"
@@ -92,9 +93,10 @@ def parse_args():
                              "(dropped by default).")
 
     # Output
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output video file path. If omitted, a descriptive name is auto-generated.")
-    parser.add_argument("--fps", type=int, default=15, help="Output video FPS.")
+    parser.add_argument("--output-dir", type=str, default=f"./results/custom-prompts",
+                        help="Output directory.")
+    parser.add_argument("--output_name", type=str, default="Wan2.2-TI2V-5B-e2e-ttt-fomaml-with-conditioning.mp4", help="Output video name.")
+    parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
 
     return parser.parse_args()
@@ -113,6 +115,10 @@ def main():
         ],
         tokenizer_config=ModelConfig(path=os.path.join(args.model_dir, "google/umt5-xxl")),
     )
+
+    output_dir = os.path.join(args.output_dir, args.prompt[:30])
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, args.output_name)
 
     # Inject the LoRA "memory scratchpad" and (optionally) load the meta-trained phi_0.
     phi0 = inject_lora_for_ttt(
@@ -150,16 +156,14 @@ def main():
         negative_prompt=args.negative_prompt,
     )
 
+    start_time = time.time()
     frames = generator.generate(**generate_kwargs)
-
-    if args.output is not None:
-        output_path = args.output
-    else:
-        output_path = (f"video_{args.algorithm}_Wan2.2-TI2V-5B"
-                       f"_num_chunks_{args.num_chunks}_frames_per_chunk_{args.frames_per_chunk}.mp4")
+    end_time = time.time()
+    print(f"Time taken to generate video: {end_time - start_time} seconds")
 
     save_video(frames, output_path, fps=args.fps, quality=args.quality)
-    print(f"Saved a {len(frames)}-frame E2E-TTT long video to {output_path}.")
+    conditioning = "with" if args.condition_on_last_frame else "without"
+    print(f"Saved a {len(frames)}-frame E2E-TTT long video with {args.algorithm} algorithm {conditioning} conditioning to {output_path}.")
 
 
 if __name__ == "__main__":

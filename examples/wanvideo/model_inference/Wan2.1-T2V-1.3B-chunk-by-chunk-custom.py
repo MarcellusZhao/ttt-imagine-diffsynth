@@ -9,11 +9,7 @@ chunks and its weights are never modified — every chunk is an independent
 text-to-video generation. It exists to show what long-video generation looks like
 without any test-time training / LoRA "memory scratchpad".
 
-`--condition_on_last_chunk` optionally adds continuity between chunks: each chunk
-after the first is seeded with the *entire previous chunk* and generated via the
-video-to-video path (the previous chunk's frames are VAE-encoded and partially
-renoised to `--denoising_strength`, so generation continues from them). Note
-Wan2.1-T2V-1.3B is a pure T2V model with no native image conditioning, so this
+Note: Wan2.1-T2V-1.3B is a pure T2V model with no native image conditioning, so this
 uses the V2V seed-video path rather than true I2V `input_image` conditioning
 (which is a no-op on this DiT). With the flag off, chunks are fully independent.
 """
@@ -26,8 +22,8 @@ from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 
 
-DEFAULT_PROMPT = "纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地上迅速奔跑。小狗毛色棕黄，两只耳朵立起，神情专注而欢快。阳光洒在它身上，使得毛发看上去格外柔软而闪亮。背景是一片开阔的草地，偶尔点缀着几朵野花，远处隐约可见蓝天和几片白云。透视感鲜明，捕捉小狗奔跑时的动感和四周草地的生机。中景侧面移动视角。"
-DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+# DEFAULT_PROMPT = "纪实摄影风格画面，一只活泼的小狗在绿茵茵的草地上迅速奔跑。小狗毛色棕黄，两只耳朵立起，神情专注而欢快。阳光洒在它身上，使得毛发看上去格外柔软而闪亮。背景是一片开阔的草地，偶尔点缀着几朵野花，远处隐约可见蓝天和几片白云。透视感鲜明，捕捉小狗奔跑时的动感和四周草地的生机。中景侧面移动视角。"
+# DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 DEFAULT_MODEL_DIR = "/work/nlp/hzhao/checkpoints/wan/Wan2.1-T2V-1.3B"
 
 
@@ -43,9 +39,9 @@ def parse_args():
                         help="Device to load the pipeline on.")
 
     # Prompts
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT,
+    parser.add_argument("--prompt", type=str, required=True,
                         help="Text prompt describing the video to generate.")
-    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
+    parser.add_argument("--negative_prompt", type=str, required=True,
                         help="Negative prompt.")
 
     # Chunk-by-chunk controls (mirror InferenceConfig in the E2E-TTT script).
@@ -64,27 +60,15 @@ def parse_args():
     parser.add_argument("--cfg_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
     parser.add_argument("--sigma_shift", type=float, default=5.0, help="Flow-matching sigma shift.")
 
-    # Inter-chunk conditioning
-    parser.add_argument("--no_condition_on_last_chunk", dest="condition_on_last_chunk",
-                        action="store_false",
-                        help="Disable seeding each chunk on the previous chunk (V2V continuity). "
-                             "Enabled by default; when disabled, every chunk is independent.")
-    parser.add_argument("--denoising_strength", type=float, default=0.7,
-                        help="V2V renoising strength for conditioned chunks: 1.0 ignores the seed "
-                             "chunk entirely (pure T2V), lower values keep more of the previous chunk.")
-
     # Output
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output video file path. If omitted, a descriptive name is auto-generated.")
-    parser.add_argument("--fps", type=int, default=15, help="Output video FPS.")
+    parser.add_argument("--output-dir", type=str, default=f"./results/custom-prompts",
+                        help="Output directory.")
+    parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
-
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
-
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=args.device,
@@ -96,11 +80,14 @@ def main():
         tokenizer_config=ModelConfig(path=os.path.join(args.model_dir, "google/umt5-xxl")),
     )
 
+    output_dir = os.path.join(args.output_dir, args.prompt[:30])
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"Wan2.1-T2V-1.3B-chunk-by-chunk.mp4")
+
     # Generate chunk by chunk. The base model never memorizes past chunks and its
     # weights are never modified. The only optional carry-over is the previous chunk
     # itself, fed back as a V2V seed when --condition_on_last_chunk is on.
     all_frames = []
-    prev_chunk = None
     for k in range(args.num_chunks):
         call_kwargs = dict(
             prompt=args.prompt,
@@ -114,31 +101,13 @@ def main():
             tiled=True,
             seed=args.seed + k,
         )
-        # Seed this chunk with the entire previous chunk and partially renoise it,
-        # so generation continues from the previous chunk's content/motion.
-        if args.condition_on_last_chunk and prev_chunk is not None:
-            call_kwargs["input_video"] = prev_chunk
-            call_kwargs["denoising_strength"] = args.denoising_strength
 
         frames = pipe(**call_kwargs)
         all_frames.extend(frames)
-        prev_chunk = frames
-        print(f"[chunk-by-chunk] generated chunk {k + 1}/{args.num_chunks} ({len(frames)} frames)"
-              + (" [conditioned on prev chunk]" if args.condition_on_last_chunk and k > 0 else ""))
-
-    if args.output is not None:
-        output_path = args.output
-    elif args.condition_on_last_chunk:
-        output_path = (f"video_with_conditioning_chunk_by_chunk_Wan2.1-T2V-1.3B"
-                       f"_denoising_strength_{args.denoising_strength}"
-                       f"_num_chunks_{args.num_chunks}_frames_per_chunk_{args.frames_per_chunk}.mp4")
-    else:
-        output_path = (f"video_without_conditioning_chunk_by_chunk_Wan2.1-T2V-1.3B"
-                       f"_num_chunks_{args.num_chunks}_frames_per_chunk_{args.frames_per_chunk}.mp4")
+        print(f"[chunk-by-chunk] generated chunk {k + 1}/{args.num_chunks} ({len(frames)} frames)")
 
     save_video(all_frames, output_path, fps=args.fps, quality=args.quality)
-    conditioning = "with" if args.condition_on_last_chunk else "without"
-    print(f"Saved a {len(all_frames)}-frame chunk-by-chunk long video {conditioning} conditioning to {output_path}.")
+    print(f"Saved a {len(all_frames)}-frame chunk-by-chunk long video to {output_path}.")
 
 
 if __name__ == "__main__":

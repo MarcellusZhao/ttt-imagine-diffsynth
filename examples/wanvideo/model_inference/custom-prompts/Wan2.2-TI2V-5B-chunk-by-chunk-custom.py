@@ -17,6 +17,7 @@ continue from the previous chunk's last frame.
 import argparse
 import glob
 import os
+import time
 
 import torch
 from PIL import Image
@@ -24,8 +25,8 @@ from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 
 
-DEFAULT_PROMPT = "两只可爱的橘猫戴上拳击手套，站在一个拳击台上搏斗。"
-DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+# DEFAULT_PROMPT = "两只可爱的橘猫戴上拳击手套，站在一个拳击台上搏斗。"
+# DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 DEFAULT_MODEL_DIR = "/work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B"
 
 
@@ -41,9 +42,9 @@ def parse_args():
                         help="Device to load the pipeline on.")
 
     # Prompts
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT,
+    parser.add_argument("--prompt", type=str, required=True,
                         help="Text prompt describing the video to generate.")
-    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
+    parser.add_argument("--negative_prompt", type=str, required=True,
                         help="Negative prompt.")
 
     # Chunk-by-chunk controls
@@ -66,9 +67,9 @@ def parse_args():
                              "chunk is an independent text-to-video generation.")
 
     # Output
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output video file path. If omitted, a descriptive name is auto-generated.")
-    parser.add_argument("--fps", type=int, default=15, help="Output video FPS.")
+    parser.add_argument("--output-dir", type=str, default=f"./results/custom-prompts",
+                        help="Output directory.")
+    parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
 
     return parser.parse_args()
@@ -88,8 +89,17 @@ def main():
         tokenizer_config=ModelConfig(path=os.path.join(args.model_dir, "google/umt5-xxl")),
     )
 
+    output_dir = os.path.join(args.output_dir, args.prompt[:30])
+    os.makedirs(output_dir, exist_ok=True)
+    if args.condition_on_last_chunk:
+        output_path = os.path.join(output_dir, f"Wan2.2-TI2V-5B-chunk-by-chunk-with-conditioning.mp4")
+    else:
+        output_path = os.path.join(output_dir, f"Wan2.2-TI2V-5B-chunk-by-chunk-without-conditioning.mp4")
+
+    
     all_frames = []
     cond_image = None
+    total_time = 0
     for k in range(args.num_chunks):
         call_kwargs = dict(
             prompt=args.prompt,
@@ -104,7 +114,11 @@ def main():
         if cond_image is not None:
             call_kwargs["input_image"] = cond_image
 
+        start_time = time.time()
         frames = pipe(**call_kwargs)
+        end_time = time.time()
+        total_time += end_time - start_time
+        print(f"Time taken to generate chunk {k + 1} of {args.num_chunks}: {end_time - start_time} seconds")
         # The first frame of a conditioned follow-up chunk reproduces the anchor frame;
         # drop it to avoid a duplicate-frame seam at the chunk boundary.
         emitted = frames[1:] if (args.condition_on_last_chunk and k > 0) else frames
@@ -114,16 +128,8 @@ def main():
         print(f"[chunk-by-chunk] generated chunk {k + 1}/{args.num_chunks} ({len(emitted)} frames)"
               + (" [anchored on prev chunk]" if args.condition_on_last_chunk and k > 0 else ""))
 
-    if args.output is not None:
-        output_path = args.output
-    elif args.condition_on_last_chunk:
-        output_path = (f"video_with_conditioning_chunk_by_chunk_Wan2.2-TI2V-5B"
-                       f"_num_chunks_{args.num_chunks}_frames_per_chunk_{args.frames_per_chunk}.mp4")
-    else:
-        output_path = (f"video_without_conditioning_chunk_by_chunk_Wan2.2-TI2V-5B"
-                       f"_num_chunks_{args.num_chunks}_frames_per_chunk_{args.frames_per_chunk}.mp4")
-
     save_video(all_frames, output_path, fps=args.fps, quality=args.quality)
+    print(f"Total time taken to generate video: {total_time} seconds")
     conditioning = "with" if args.condition_on_last_chunk else "without"
     print(f"Saved a {len(all_frames)}-frame chunk-by-chunk video {conditioning} conditioning to {output_path}.")
 
