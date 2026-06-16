@@ -12,8 +12,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 dataset:
-  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
-  dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ttt_imagine_10k.csv
+  # dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
+  dataset_base_path: /work/nlp/hzhao/datasets/UltraVideo-Long/clips_long_1920
+  # dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ttt_imagine_10k.csv
+  dataset_metadata_path: /home/hzhao/ttt-imagine-diffsynth/datasets/ultravideo_long/ultravideo_long_filtered_short_11k.csv
   dataset_repeat: 1
   height: 720 # [352, 720]
   width: 1280 # [512, 1280]
