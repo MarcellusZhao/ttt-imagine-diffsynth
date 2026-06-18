@@ -20,6 +20,8 @@ AGENTS.md
 evaluation_results/*
 results/*
 *.csv
+*.png
+*.pdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
