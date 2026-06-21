@@ -16,6 +16,13 @@ Usage:
 
     # Skip ffmpeg (just copy) for files whose FPS already matches:
     python -m data_utils.resample_fps ... --copy-matching
+
+Encoding runs in parallel across files (one ffmpeg process per worker). On a
+many-core box this is the dominant speedup since a single x264 encode can't use
+all cores. Tune with --workers / --threads (workers x threads ~ core count), and
+drop --preset to veryfast for a large per-file speedup at a small file-size cost:
+
+    python -m data_utils.resample_fps ... --workers 32 --threads 4 --preset veryfast
 """
 
 import argparse
@@ -23,14 +30,66 @@ import json
 import os
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from os import path as osp
 from typing import List, Optional
 
 from imageio_ffmpeg import get_ffmpeg_exe
 from tqdm import tqdm
 
-from inspect_video import probe_video
+from dataclasses import dataclass
+import imageio
 
+@dataclass
+class VideoMetadata:
+    path: str
+    width: int
+    height: int
+    fps: float
+    duration_sec: float
+    num_frames: int
+    codec: Optional[str] = None
+    pix_fmt: Optional[str] = None
+    file_size_mb: float = 0.0
+    error: Optional[str] = None  # populated if probing failed
+
+def probe_video(video_path: str, count_frames: bool = False) -> VideoMetadata:
+    """Read header metadata via imageio's ffmpeg backend.
+
+    `count_frames=False` (default) computes frame count as round(duration * fps),
+    which is fast and accurate for constant-frame-rate videos. Set True to force
+    a full decode pass (slow but exact, useful for variable-frame-rate sources).
+    """
+    try:
+        reader = imageio.get_reader(video_path, "ffmpeg")
+        meta = reader.get_meta_data()
+        width, height = meta["size"]  # imageio reports (W, H)
+        fps = float(meta["fps"])
+        duration = float(meta["duration"])
+        if count_frames:
+            num_frames = reader.count_frames()
+        else:
+            num_frames = int(round(duration * fps))
+        codec = meta.get("codec")
+        pix_fmt = meta.get("pix_fmt")
+        reader.close()
+        return VideoMetadata(
+            path=video_path,
+            width=width,
+            height=height,
+            fps=fps,
+            duration_sec=duration,
+            num_frames=num_frames,
+            codec=codec,
+            pix_fmt=pix_fmt,
+            file_size_mb=osp.getsize(video_path) / (1024 ** 2),
+        )
+    except Exception as e:
+        return VideoMetadata(
+            path=video_path,
+            width=0, height=0, fps=0.0, duration_sec=0.0, num_frames=0,
+            error=f"{type(e).__name__}: {e}",
+        )
 
 def build_ffmpeg_cmd(
     input_path: str,
@@ -40,22 +99,42 @@ def build_ffmpeg_cmd(
     height: Optional[int] = None,
     crf: int = 18,
     preset: str = "medium",
+    threads: int = 0,
 ) -> List[str]:
     """Compose an ffmpeg command line for FPS resampling.
 
-    `-r <fps>` placed AFTER `-i` is the *output* frame rate. ffmpeg drops or
-    duplicates frames as needed (no temporal interpolation). `-crf 18` is
-    visually-lossless x264; lower = higher quality (and larger files).
+    Resampling uses the `fps` *filter* (`fps=<n>`), NOT the bare `-r` output
+    flag. The `fps` filter rebuilds a constant-rate timeline by dropping/
+    duplicating frames against their PTS, so it produces correct-duration CFR
+    output even for variable-frame-rate or bad-timestamp sources. The `-r`
+    output option, by contrast, leans on the source timebase/PTS and can leave
+    VFR sources with their original frame spacing — inflating the muxed
+    duration (e.g. a 30s clip muxed as 1440s) while the declared fps still
+    reads correctly. `-vsync cfr` forces constant-rate muxing as a backstop
+    (the older spelling of `-fps_mode cfr`; works on the older ffmpeg builds
+    that imageio_ffmpeg tends to bundle).
+    `-crf 18` is visually-lossless x264; lower = higher quality (larger files).
+
+    `threads` caps x264's internal thread count. When running many encodes in
+    parallel, set this low (e.g. 2-4) so jobs don't oversubscribe the CPU; x264
+    scales poorly past ~8 threads anyway, so per-file threading buys little once
+    the machine is already saturated by concurrent jobs. `0` lets ffmpeg decide.
     """
-    cmd = [get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", input_path]
+    # Build a single filtergraph: optional scale, then the fps resampler.
+    filters = []
     if width is not None and height is not None:
-        cmd += ["-vf", f"scale={width}:{height}"]
+        filters.append(f"scale={width}:{height}")
+    filters.append(f"fps={target_fps}")
+
+    cmd = [get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", input_path]
     cmd += [
-        "-r", str(target_fps),
+        "-vf", ",".join(filters),
+        "-vsync", "cfr",  # force constant-frame-rate muxing (works on old + new ffmpeg)
         "-c:v", "libx264",
         "-crf", str(crf),
         "-preset", preset,
         "-pix_fmt", "yuv420p",
+        "-threads", str(threads),
         "-an",  # drop audio: video-diffusion datasets are visual-only
         output_path,
     ]
@@ -69,6 +148,8 @@ def resample_one(
     width: Optional[int] = None,
     height: Optional[int] = None,
     crf: int = 18,
+    preset: str = "medium",
+    threads: int = 0,
     skip_if_exists: bool = True,
     copy_if_already_match: bool = False,
 ) -> str:
@@ -88,7 +169,8 @@ def resample_one(
             shutil.copy2(input_path, output_path)
             return "copied (fps already matches)"
 
-    cmd = build_ffmpeg_cmd(input_path, output_path, target_fps, width, height, crf)
+    cmd = build_ffmpeg_cmd(input_path, output_path, target_fps, width, height,
+                           crf, preset, threads)
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         # Remove partial output so a re-run does not see stale corrupt data.
@@ -158,6 +240,36 @@ def make_curated_record(raw: dict, out_path: str, target_fps: int,
     return record
 
 
+def _resample_job(job: dict) -> dict:
+    """Process pool worker: resample one video and build its curated record.
+
+    Top-level (picklable) so it can run in a ProcessPoolExecutor. Returns a dict
+    with the status and curated record on success, or the error on failure —
+    exceptions are captured rather than raised so one bad file can't kill the pool.
+    """
+    raw = job["raw"]
+    video = raw.get("video_path") or raw.get("path", "")
+    try:
+        status = resample_one(
+            input_path=video,
+            output_path=job["out_path"],
+            target_fps=job["target_fps"],
+            width=job["width"],
+            height=job["height"],
+            crf=job["crf"],
+            preset=job["preset"],
+            threads=job["threads"],
+            skip_if_exists=job["skip_if_exists"],
+            copy_if_already_match=job["copy_if_already_match"],
+        )
+        record = make_curated_record(
+            raw, job["out_path"], job["target_fps"], job["width"], job["height"]
+        )
+        return {"video": video, "status": status, "record": record}
+    except Exception as e:
+        return {"video": video, "status": "failed", "record": None, "error": str(e)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dataset_path", required=True,
@@ -179,6 +291,12 @@ def main():
     parser.add_argument("--copy-matching", action="store_true",
                         help="If a file's fps already matches --target_fps and no resize "
                              "is requested, copy it instead of re-encoding (lossless, fast)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Number of videos to encode concurrently. 0 (default) = auto "
+                             "(cpu_count // --threads). Set to 1 for the old serial behavior.")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="x264 threads per encode. Keep small when running many workers; "
+                             "workers x threads should roughly match the core count.")
     args = parser.parse_args()
 
     if (args.width is None) != (args.height is None):
@@ -205,9 +323,13 @@ def main():
         print("No accessible videos found in raw_metadata.jsonl")
         return
 
+    workers = args.workers if args.workers > 0 else max(1, (os.cpu_count() or 1) // max(1, args.threads))
+    workers = min(workers, len(records))
+
     print(f"Resampling {len(records)} video(s) -> {args.target_fps} fps")
     print(f"  Metadata: {metadata_path}")
     print(f"  Output:   {output_dir}")
+    print(f"  Workers:  {workers} x {args.threads} thread(s) (preset={args.preset})")
     if args.width is not None:
         print(f"  Resizing to {args.width}x{args.height}")
 
@@ -217,28 +339,42 @@ def main():
         "copied (fps already matches)": 0,
         "failed": 0,
     }
+    jobs = [
+        {
+            "raw": raw,
+            "out_path": osp.join(
+                output_dir,
+                relative_output(raw.get("video_path") or raw.get("path", ""), input_dir),
+            ),
+            "target_fps": args.target_fps,
+            "width": args.width,
+            "height": args.height,
+            "crf": args.crf,
+            "preset": args.preset,
+            "threads": args.threads,
+            "skip_if_exists": not args.overwrite,
+            "copy_if_already_match": args.copy_matching,
+        }
+        for raw in records
+    ]
+
     curated_records: List[dict] = []
-    for raw in tqdm(records):
-        video = raw.get("video_path") or raw.get("path", "")
-        out_path = osp.join(output_dir, relative_output(video, input_dir))
-        try:
-            status = resample_one(
-                input_path=video,
-                output_path=out_path,
-                target_fps=args.target_fps,
-                width=args.width,
-                height=args.height,
-                crf=args.crf,
-                skip_if_exists=not args.overwrite,
-                copy_if_already_match=args.copy_matching,
-            )
-            counts[status] = counts.get(status, 0) + 1
-            curated_records.append(
-                make_curated_record(raw, out_path, args.target_fps, args.width, args.height)
-            )
-        except Exception as e:
-            counts["failed"] += 1
-            print(f"FAILED {video}: {e}")
+
+    def _tally(result: dict) -> None:
+        counts[result["status"]] = counts.get(result["status"], 0) + 1
+        if result["record"] is not None:
+            curated_records.append(result["record"])
+        else:
+            print(f"FAILED {result['video']}: {result.get('error', 'unknown error')}")
+
+    if workers == 1:
+        for job in tqdm(jobs):
+            _tally(_resample_job(job))
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_resample_job, job) for job in jobs]
+            for fut in tqdm(as_completed(futures), total=len(futures)):
+                _tally(fut.result())
 
     with open(curated_metadata_path, "w", encoding="utf-8") as fh:
         for record in curated_records:
