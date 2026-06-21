@@ -37,7 +37,7 @@ model:
 train:
   learning_rate: 1.0e-5
   num_epochs: 1
-  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_cn4_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16
+  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_acn_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16
   remove_prefix_in_ckpt: pipe.dit.
   use_gradient_checkpointing: true
 
@@ -63,7 +63,7 @@ e2e_ttt:
   # chunks. With num_frames:0 above, the count tracks true video duration and varies
   # per example (watch train/num_chunks in wandb). NOTE: 5B @ 720x1280 on long clips —
   # an unbounded count can OOM; set a positive value here (e.g. 4-8) as a memory cap.
-  e2e_num_chunks: 4 # 0 = adaptive; positive = max cap
+  e2e_num_chunks: 0 # 0 = adaptive; positive = max cap
   e2e_frames_per_chunk: 41 # [13, 25, 37, 49]
   e2e_num_gradient_steps: 1 
   e2e_num_mc_samples: 1

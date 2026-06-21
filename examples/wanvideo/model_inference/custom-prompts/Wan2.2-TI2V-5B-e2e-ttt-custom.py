@@ -76,7 +76,7 @@ def parse_args():
                         help="Test-time training steps applied per chunk.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--height", type=int, default=704, help="Output video height.")
-    parser.add_argument("--width", type=int, default=1248, help="Output video width.")
+    parser.add_argument("--width", type=int, default=1280, help="Output video width.")
     parser.add_argument("--num_inference_steps", type=int, default=50,
                         help="Number of denoising steps.")
     parser.add_argument("--cfg_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
