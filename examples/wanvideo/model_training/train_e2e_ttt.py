@@ -84,8 +84,11 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         # the same quantity). ModelLogger reads these two attributes; None suppresses.
         self.lr_log_key = "train/meta_lr"
         self.loss_log_key = None
+        # num_chunks is an optional max cap: <=0 (or unset) -> adaptive, so the chunk
+        # count is driven purely by each clip's length (len(frames) // frames_per_chunk).
+        _num_chunks = int(e2e_num_chunks)
         self.chunk_cfg = ChunkingConfig(
-            num_chunks=int(e2e_num_chunks),
+            num_chunks=_num_chunks if _num_chunks > 0 else None,
             frames_per_chunk=int(e2e_frames_per_chunk),
         )
         self.inner_cfg = InnerLoopConfig(
@@ -101,8 +104,10 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         self.truncate_steps = [int(s) for s in str(e2e_truncate_steps).split(",") if s != ""]
         # Dedicated 1000-step training scheduler (does not touch any inference scheduler).
         self.train_scheduler = make_training_scheduler(float(e2e_sigma_shift))
+        _chunks_desc = ("adaptive" if self.chunk_cfg.num_chunks is None
+                        else f"<={self.chunk_cfg.num_chunks}")
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
-              f"chunks={self.chunk_cfg.num_chunks} x {self.chunk_cfg.frames_per_chunk}f | "
+              f"chunks={_chunks_desc} x {self.chunk_cfg.frames_per_chunk}f | "
               f"outer_lr={self.outer_lr} | "
               f"algorithm={self.inner_cfg.algorithm} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
@@ -119,12 +124,17 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         prompt = data["prompt"]
 
         fpc = self.chunk_cfg.frames_per_chunk
-        n = min(self.chunk_cfg.num_chunks, len(frames) // fpc)
+        # Adaptive chunk count: one chunk per `fpc` frames in THIS clip. num_chunks (if
+        # set) only caps it as a memory ceiling; leftover frames < fpc are dropped.
+        n = len(frames) // fpc
+        if self.chunk_cfg.num_chunks is not None:
+            n = min(self.chunk_cfg.num_chunks, n)
         if n < 2:
-            raise ValueError(
-                f"Video has {len(frames)} frames but needs >= 2 chunks of {fpc} frames. "
-                f"Increase --num_frames (>= {2 * fpc}) or lower --e2e_frames_per_chunk."
-            )
+            # Too short to form even one memorize->predict pair. Signal the caller to
+            # skip this video (rather than crash) so a mixed-length dataset trains fine.
+            print(f"[E2E-TTT] skipping clip with {len(frames)} frames: needs >= 2 chunks "
+                  f"of {fpc} frames (>= {2 * fpc}).")
+            return [], None
 
         # NOTE: pipe.load_models_to_device() is a no-op in the training path —
         # VRAM management is only wired up for inference (base_pipeline guards it
@@ -215,8 +225,24 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             out["cpu/mem_alloc_gb"] = psutil.Process().memory_info().rss / 1e9
         return out
 
+    def _zero_loss_skip(self):
+        """Return a graph-connected zero scalar so a skipped (too-short) video is a
+        no-op step: backward() deposits zero LoRA grads and the outer optimizer step
+        applies no meaningful update. (With AdamW weight-decay a zero-grad step still
+        applies negligible decoupled decay; skips are rare, so this is harmless.)"""
+        zero = None
+        for p in self.trainable_modules():
+            term = p.float().sum() * 0.0
+            zero = term if zero is None else zero + term
+        if zero is None:  # no trainable params (shouldn't happen) -> detached zero
+            zero = torch.zeros((), device=self.pipe.device, requires_grad=True)
+        self.log_metrics = {"train/skipped_short_video": 1.0}
+        return zero
+
     def forward(self, data, inputs=None):
         chunk_latents, context = self._encode_chunks(data)
+        if len(chunk_latents) < 2:
+            return self._zero_loss_skip()
         self.pipe.load_models_to_device(["dit"])
         meta_loss, stats = run_meta_inner_loop(
             self.pipe,
@@ -245,6 +271,10 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             "train/num_pred_pairs": float(stats["num_pred"]),
             "train/num_mem_steps": float(stats["num_mem_steps"]),
             "train/inner_lr": float(self.inner_cfg.inner_lr_init),
+            # Actual chunks used for THIS clip (adaptive: clip_frames // frames_per_chunk,
+            # capped by num_chunks if set). Watch this to confirm the count varies per video.
+            "train/num_chunks": float(len(chunk_latents)),
+            "train/skipped_short_video": 0.0,
         }
         # Inner adaptation magnitude: how far the inner loop moved phi_0 per video.
         if "inner_adapt_norm" in stats:
@@ -262,7 +292,9 @@ def e2e_ttt_parser():
     parser.add_argument("--frame_rate", type=int, default=24,
                         help="Target frame rate (fps) for sampling video frames in the data operator.")
     g = parser.add_argument_group("E2E-TTT")
-    g.add_argument("--e2e_num_chunks", type=int, default=3, help="Number of temporal chunks per video.")
+    g.add_argument("--e2e_num_chunks", type=int, default=0,
+                   help="Optional max temporal chunks per video (memory ceiling). "
+                        "<=0 means adaptive: one chunk per --e2e_frames_per_chunk frames in the clip.")
     g.add_argument("--e2e_frames_per_chunk", type=int, default=21, help="Frames per chunk (4n+1).")
     g.add_argument("--e2e_num_gradient_steps", type=int, default=1, help="Inner-loop SGD steps per memorize chunk.")
     g.add_argument("--e2e_num_mc_samples", type=int, default=2, help="Monte-Carlo (t, noise) samples per flow-loss eval.")
@@ -382,7 +414,9 @@ if __name__ == "__main__":
             width=args.width,
             height_division_factor=_spatial_div,
             width_division_factor=_spatial_div,
-            num_frames=args.num_frames,
+            # num_frames is now an optional UPPER bound; <=0 (or unset) -> load each
+            # clip's full length so the adaptive chunker sees the true video duration.
+            num_frames=(args.num_frames if args.num_frames and args.num_frames > 0 else None),
             time_division_factor=4,
             time_division_remainder=1,
             frame_rate=args.frame_rate

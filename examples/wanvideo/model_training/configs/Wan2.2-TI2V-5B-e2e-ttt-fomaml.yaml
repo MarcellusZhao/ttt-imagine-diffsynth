@@ -13,13 +13,16 @@
 
 dataset:
   # dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video
-  dataset_base_path: /work/nlp/hzhao/datasets/UltraVideo-Long/clips_long_1920
+  # dataset_base_path: /work/nlp/hzhao/datasets/UltraVideo-Long/clips_long_1920
+  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ultravideo_long/curated_videos
   # dataset_metadata_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ttt_imagine_10k.csv
-  dataset_metadata_path: /home/hzhao/ttt-imagine-diffsynth/datasets/ultravideo_long/ultravideo_long_filtered_short_11k.csv
+  dataset_metadata_path: /home/hzhao/ttt-imagine-diffsynth/datasets/ultravideo_long/ultravideo_long_filtered_short_3k.csv
   dataset_repeat: 1
   height: 720 # [352, 720]
   width: 1280 # [512, 1280]
-  num_frames: 164
+  # 0 = load each clip's FULL length so the chunk count adapts to video duration.
+  # Set a positive value to cap frames per clip (acts as an upper bound).
+  num_frames: 0
   frame_rate: 16
 
 model:
@@ -34,7 +37,7 @@ model:
 train:
   learning_rate: 1.0e-5
   num_epochs: 1
-  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml
+  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_cn4_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16
   remove_prefix_in_ckpt: pipe.dit.
   use_gradient_checkpointing: true
 
@@ -48,14 +51,19 @@ lora:
 # stream live, or `disabled` to turn off without editing this file. The run name
 # defaults to the output_path basename. All metrics are logged under the wandb
 # "train" group each step: train/meta_loss, train/memorize_loss,
-# train/num_pred_pairs, train/num_mem_steps, train/inner_lr, and train/meta_lr
+# train/num_pred_pairs, train/num_mem_steps, train/inner_lr, train/num_chunks
+# (adaptive per-clip chunk count), train/skipped_short_video, and train/meta_lr
 # (the live outer-loop LR).
 logger:
   enable_wandb_log: true
   wandb_project: E2E-TTT
 
 e2e_ttt:
-  e2e_num_chunks: 4 # [2, 4, 6, 8]
+  # 0 = adaptive chunk count: each clip yields (clip_frames // e2e_frames_per_chunk)
+  # chunks. With num_frames:0 above, the count tracks true video duration and varies
+  # per example (watch train/num_chunks in wandb). NOTE: 5B @ 720x1280 on long clips —
+  # an unbounded count can OOM; set a positive value here (e.g. 4-8) as a memory cap.
+  e2e_num_chunks: 4 # 0 = adaptive; positive = max cap
   e2e_frames_per_chunk: 41 # [13, 25, 37, 49]
   e2e_num_gradient_steps: 1 
   e2e_num_mc_samples: 1

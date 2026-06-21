@@ -127,9 +127,15 @@ class FrameSamplerByRateMixin:
         return int(total_available_frames)
 
     def get_num_frames(self, reader):
+        total_frames = int(self.get_available_num_frames(reader))
+        if self.num_frames is None:
+            # Load the full clip; snap down to the temporal division factor (4n+1 for Wan).
+            num_frames = total_frames
+            while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+                num_frames -= 1
+            return num_frames
         num_frames = self.num_frames
-        total_frames = self.get_available_num_frames(reader)
-        if int(total_frames) < num_frames:
+        if total_frames < num_frames:
             num_frames = total_frames
             while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
                 num_frames -= 1
@@ -186,7 +192,7 @@ class LoadGIF(DataProcessingOperator):
     def get_num_frames(self, path):
         num_frames = self.num_frames
         images = iio.imread(path, mode="RGB")
-        if len(images) < num_frames:
+        if num_frames is None or len(images) < num_frames:
             num_frames = len(images)
             while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
                 num_frames -= 1

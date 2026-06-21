@@ -154,15 +154,20 @@ class InnerLoopConfig:
 class ChunkingConfig:
     """Temporal chunking for the memorize->predict inner loop.
 
-    Each training video is split into ``num_chunks`` contiguous sub-clips of
-    ``frames_per_chunk`` frames; each sub-clip is VAE-encoded independently
-    (separate V-Tokens per chunk). ``frames_per_chunk`` should be 4n+1 so it aligns
-    with the Wan temporal VAE compression. The dataset's ``num_frames`` must be
-    >= ``num_chunks * frames_per_chunk``.
+    Each training video is split into contiguous sub-clips of ``frames_per_chunk``
+    frames; each sub-clip is VAE-encoded independently (separate V-Tokens per chunk).
+    ``frames_per_chunk`` should be 4n+1 so it aligns with the Wan temporal VAE
+    compression.
+
+    Only the chunk *size* is fixed; the chunk *count* adapts to each clip's length:
+    a video of ``F`` frames yields ``F // frames_per_chunk`` chunks. ``num_chunks`` is
+    an optional upper bound (``None`` = unbounded) kept purely as a memory ceiling,
+    since the second-order MAML graph grows with the chunk count. A clip too short to
+    form 2 chunks (the memorize->predict minimum) is skipped, not chunked.
     """
 
-    num_chunks: int = 3
     frames_per_chunk: int = 21  # 4*5 + 1
+    num_chunks: Optional[int] = None  # None = adaptive (one chunk per frames_per_chunk frames)
 
 
 @dataclass
