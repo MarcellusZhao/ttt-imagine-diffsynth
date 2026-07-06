@@ -51,6 +51,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_sigma_shift=5.0,
         e2e_algorithm="maml",
         e2e_first_order=False,
+        e2e_condition_on_last_frame=True,
         outer_lr=None,
         **kwargs,
     ):
@@ -104,10 +105,22 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         self.truncate_steps = [int(s) for s in str(e2e_truncate_steps).split(",") if s != ""]
         # Dedicated 1000-step training scheduler (does not touch any inference scheduler).
         self.train_scheduler = make_training_scheduler(float(e2e_sigma_shift))
+        # First-frame (last-frame-of-previous-chunk) conditioning to match inference. This is
+        # TI2V-5B's fused VAE first-frame mechanism, so it is only effective on a DiT that
+        # supports it (fuse_vae_embedding_in_latents); requesting it on e.g. Wan2.1-T2V is a
+        # no-op. When effective, chunks are sliced with a 1-frame overlap so each predict
+        # chunk's first frame is the previous chunk's last frame (the inference anchor).
+        _supports_fused = bool(getattr(self.pipe.dit, "fuse_vae_embedding_in_latents", False))
+        self.condition_on_last_frame = bool(e2e_condition_on_last_frame) and _supports_fused
+        if bool(e2e_condition_on_last_frame) and not _supports_fused:
+            print("[E2E-TTT] NOTE: this DiT has no fused first-frame conditioning "
+                  "(fuse_vae_embedding_in_latents); training without last-frame conditioning "
+                  "(contiguous, non-overlapping chunks). This is expected for Wan2.1-T2V.")
         _chunks_desc = ("adaptive" if self.chunk_cfg.num_chunks is None
                         else f"<={self.chunk_cfg.num_chunks}")
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
               f"chunks={_chunks_desc} x {self.chunk_cfg.frames_per_chunk}f | "
+              f"condition_on_last_frame={self.condition_on_last_frame} | "
               f"outer_lr={self.outer_lr} | "
               f"algorithm={self.inner_cfg.algorithm} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
@@ -124,16 +137,22 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         prompt = data["prompt"]
 
         fpc = self.chunk_cfg.frames_per_chunk
-        # Adaptive chunk count: one chunk per `fpc` frames in THIS clip. num_chunks (if
-        # set) only caps it as a memory ceiling; leftover frames < fpc are dropped.
-        n = len(frames) // fpc
+        # Chunk stride. With first-frame conditioning, consecutive chunks OVERLAP by one
+        # frame (stride = fpc-1) so each chunk's first frame is the previous chunk's last
+        # frame -- the same autoregressive anchor the inference generator pins to
+        # (drop_boundary_frame). Without conditioning, chunks are contiguous (stride = fpc).
+        stride = (fpc - 1) if self.condition_on_last_frame else fpc
+        # Adaptive chunk count: as many chunks as fit in THIS clip. num_chunks (if set)
+        # only caps it as a memory ceiling; leftover frames < fpc are dropped.
+        n = (len(frames) - fpc) // stride + 1 if len(frames) >= fpc else 0
         if self.chunk_cfg.num_chunks is not None:
             n = min(self.chunk_cfg.num_chunks, n)
         if n < 2:
             # Too short to form even one memorize->predict pair. Signal the caller to
             # skip this video (rather than crash) so a mixed-length dataset trains fine.
+            _need = fpc + stride  # frames for 2 chunks at this stride
             print(f"[E2E-TTT] skipping clip with {len(frames)} frames: needs >= 2 chunks "
-                  f"of {fpc} frames (>= {2 * fpc}).")
+                  f"of {fpc} frames at stride {stride} (>= {_need}).")
             return [], None
 
         # NOTE: pipe.load_models_to_device() is a no-op in the training path —
@@ -148,7 +167,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         pipe.vae.to(device)
         chunk_latents = []
         for k in range(n):
-            sub = frames[k * fpc:(k + 1) * fpc]
+            sub = frames[k * stride:k * stride + fpc]
             video = pipe.preprocess_video(sub)  # [1, C, T, H, W]
             z = pipe.vae.encode([video[0]], device=device, tiled=False)
             chunk_latents.append(z.to(dtype=dtype, device=device).detach())
@@ -254,6 +273,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             write_back=False,
             algorithm=self.inner_cfg.algorithm,
+            condition_on_first_frame=self.condition_on_last_frame,
         )
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
         # `meta_loss` is logged separately as the generic "loss"; these add the MAML-specific
@@ -275,6 +295,9 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             # capped by num_chunks if set). Watch this to confirm the count varies per video.
             "train/num_chunks": float(len(chunk_latents)),
             "train/skipped_short_video": 0.0,
+            # 1.0 when the predict loss conditions on the previous chunk's last frame
+            # (TI2V-5B fused first-frame anchor), matching inference; 0.0 otherwise.
+            "train/condition_on_last_frame": float(self.condition_on_last_frame),
         }
         # Inner adaptation magnitude: how far the inner loop moved phi_0 per video.
         if "inner_adapt_norm" in stats:
@@ -312,6 +335,12 @@ def e2e_ttt_parser():
                         "--e2e_truncate_steps.")
     g.add_argument("--e2e_first_order", action="store_true",
                    help="Back-compat alias for --e2e_algorithm fomaml (drop the Hessian term).")
+    g.add_argument("--e2e_condition_on_last_frame", type=lambda s: str(s).lower() not in ("0", "false", "no"),
+                   default=True,
+                   help="Condition each predict chunk on the previous chunk's last frame, "
+                        "matching TI2V-5B inference (fused first-frame anchor + 1-frame chunk "
+                        "overlap). Effective only on a DiT with fused first-frame conditioning "
+                        "(TI2V-5B); a no-op otherwise. Set false to train without it.")
     return parser
 
 
@@ -455,6 +484,7 @@ if __name__ == "__main__":
         e2e_sigma_shift=args.e2e_sigma_shift,
         e2e_algorithm=args.e2e_algorithm,
         e2e_first_order=args.e2e_first_order,
+        e2e_condition_on_last_frame=args.e2e_condition_on_last_frame,
         outer_lr=args.learning_rate,
     )
     model_logger = ModelLogger(

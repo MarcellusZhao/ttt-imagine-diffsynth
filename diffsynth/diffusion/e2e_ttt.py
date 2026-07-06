@@ -587,12 +587,27 @@ def compute_flow_matching_loss(
     *,
     params_override: Optional[Dict[str, torch.Tensor]] = None,
     use_gradient_checkpointing: bool = False,
+    condition_on_first_frame: bool = False,
     dit=None,
 ) -> torch.Tensor:
     """Rectified flow-matching loss matching DiffSynth's ``FlowMatchSFTLoss``.
 
     ``noise_pred = model_fn(z_t, t, c)`` and target ``= noise - x0``; averaged over
     ``num_mc_samples`` random (t, noise) draws.
+
+    ``condition_on_first_frame`` replicates Wan2.2-TI2V-5B's fused first-frame (image)
+    conditioning used at inference (``WanVideoUnit_ImageEmbedderFused`` +
+    ``inputs["latents"][:, :, 0:1] = first_frame_latents`` each denoising step): the
+    first latent frame is pinned to its clean value (never noised), ``model_fn`` is told
+    ``fuse_vae_embedding_in_latents=True`` so the DiT's ``seperated_timestep`` path gives
+    that frame timestep 0 (treated as clean context), and it is excluded from the loss
+    (it is given, not predicted). Because the Wan causal VAE's first latent frame is the
+    single-frame encoding of the clip's first pixel frame, pinning ``x0[:, :, 0:1]`` is
+    exactly conditioning on that frame -- so when the caller passes an overlap-chunked
+    clip whose first frame is the previous chunk's last frame, this matches the
+    autoregressive anchor used by ``WanE2ETTTSequentialGenerator``. Only meaningful for a
+    DiT with ``fuse_vae_embedding_in_latents`` (TI2V-5B); no-op for clips with <2 latent
+    frames.
     """
     if x0.dim() != 5:
         raise ValueError(f"Expected x0 [B,C,T,H,W], got {tuple(x0.shape)}")
@@ -601,6 +616,11 @@ def compute_flow_matching_loss(
     num_ts = len(scheduler.timesteps)
     min_ts = int(inner_cfg.min_timestep_boundary * num_ts)
     max_ts = max(min_ts + 1, int(inner_cfg.max_timestep_boundary * num_ts))
+
+    # First-frame conditioning is only the TI2V-5B fused path, and it needs at least one
+    # latent frame to predict after the (pinned) anchor frame; otherwise fall back to the
+    # plain unconditioned objective.
+    condition_on_first_frame = bool(condition_on_first_frame) and x0.shape[2] >= 2
 
     # With a differentiable params_override, checkpointing is only safe because
     # _model_fn_with_override carries the override through the per-block recompute
@@ -616,12 +636,22 @@ def compute_flow_matching_loss(
         noise = torch.randn_like(x0)
         latents = scheduler.add_noise(x0, noise, timestep)
         target = scheduler.training_target(x0, noise, timestep)
+        if condition_on_first_frame:
+            # Pin the first latent frame to the clean anchor (no noise), exactly as the
+            # inference pipeline re-clamps latents[:, :, 0:1] = first_frame_latents.
+            latents = torch.cat([x0[:, :, 0:1], latents[:, :, 1:]], dim=2)
         noise_pred = _model_fn_with_override(
             pipe, dit, params_override,
             latents=latents, timestep=timestep, context=context,
             use_gradient_checkpointing=gc,
+            fuse_vae_embedding_in_latents=condition_on_first_frame,
         )
-        loss = F.mse_loss(noise_pred.float(), target.float())
+        if condition_on_first_frame:
+            # The anchor frame is given (timestep 0), not predicted -- supervise only the
+            # continuation frames, matching what the model actually generates at inference.
+            loss = F.mse_loss(noise_pred[:, :, 1:].float(), target[:, :, 1:].float())
+        else:
+            loss = F.mse_loss(noise_pred.float(), target.float())
         total = total + loss * scheduler.training_weight(timestep)
     return total / max(1, int(inner_cfg.num_mc_samples))
 
@@ -761,6 +791,7 @@ def run_meta_inner_loop(
     use_gradient_checkpointing: bool = False,
     write_back: bool = False,
     algorithm: Optional[str] = None,
+    condition_on_first_frame: bool = False,
 ):
     """Memorize->predict inner loop over chunk sequences (MAML / FOMAML / Reptile).
 
@@ -778,9 +809,17 @@ def run_meta_inner_loop(
     dropping the Hessian term and the double-backward requirement. ``algorithm`` selects
     the variant (defaults to ``inner_cfg.algorithm``); ``algorithm="reptile"`` dispatches
     to the SGD-then-interpolate Reptile path (no predict term, no second-order graph).
+
+    ``condition_on_first_frame`` (TI2V-5B only) conditions the *predict* loss on each
+    chunk's first latent frame, replicating the fused first-frame anchor the inference
+    generator pins to the previous chunk's last frame. It assumes overlap-chunked input
+    (consecutive chunks share their boundary frame); the memorize objective stays
+    unconditioned, matching the test-time ``ttt_update_inplace``.
     """
     algorithm = (algorithm or getattr(inner_cfg, "algorithm", "maml")).lower()
     if algorithm == "reptile":
+        # Reptile has no predict term -- it only ever runs the (unconditioned) memorize
+        # objective -- so first-frame conditioning does not apply and is ignored here.
         return _run_reptile_inner_loop(
             pipe, scheduler, video_chunks, video_contexts, inner_cfg,
             learned_lrs=learned_lrs,
@@ -853,10 +892,15 @@ def run_meta_inner_loop(
                 mem_step_idx += 1
 
             # ---- predict next chunk k+1 (meta term) ----
+            # At inference each follow-up chunk is generated with TI2V-5B's fused
+            # first-frame conditioning on the previous chunk's last frame; with overlap
+            # chunking that anchor IS chunks[k+1]'s first frame, so condition the predict
+            # loss on it to match the inference-time objective (see compute_flow_matching_loss).
             loss_pred = compute_flow_matching_loss(
                 pipe, scheduler, chunks[k + 1], ctx, inner_cfg,
                 params_override={**current_lora},
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                condition_on_first_frame=condition_on_first_frame,
             )
             meta_loss = meta_loss + loss_pred
             num_pred += 1
