@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0,
                         help="Base random seed; chunk k uses seed + k.")
     parser.add_argument("--height", type=int, default=704, help="Output video height.")
-    parser.add_argument("--width", type=int, default=1248, help="Output video width.")
+    parser.add_argument("--width", type=int, default=1280, help="Output video width.")
 
     # Inter-chunk conditioning
     parser.add_argument("--no_condition_on_last_chunk", dest="condition_on_last_chunk",

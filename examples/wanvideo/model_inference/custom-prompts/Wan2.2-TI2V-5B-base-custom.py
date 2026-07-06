@@ -34,7 +34,7 @@ def parse_args():
     # Generation settings
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--height", type=int, default=704, help="Output video height.")
-    parser.add_argument("--width", type=int, default=1248, help="Output video width.")
+    parser.add_argument("--width", type=int, default=1280, help="Output video width.")
     parser.add_argument("--num_frames", type=int, default=197,
                         help="Number of frames to generate.")
 

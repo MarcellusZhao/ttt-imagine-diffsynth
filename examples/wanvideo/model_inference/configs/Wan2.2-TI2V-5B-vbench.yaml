@@ -32,7 +32,7 @@ vbench:
   base_seed: 0                   # seed for clip i is base_seed + i (reproducible, distinct)
 
 generation:
-  height: 720
+  height: 704
   width: 1280
   num_frames: 161                # 4n+1 for the Wan temporal VAE
   num_inference_steps: 50

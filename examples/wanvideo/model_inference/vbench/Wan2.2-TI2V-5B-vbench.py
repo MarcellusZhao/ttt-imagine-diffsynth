@@ -95,8 +95,8 @@ def parse_args():
     parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
                         help="Negative prompt (applied to every clip).")
     parser.add_argument("--height", type=int, default=704, help="Output video height.")
-    parser.add_argument("--width", type=int, default=1248, help="Output video width.")
-    parser.add_argument("--num_frames", type=int, default=121,
+    parser.add_argument("--width", type=int, default=1280, help="Output video width.")
+    parser.add_argument("--num_frames", type=int, default=161,
                         help="Frames per clip (4n+1 for the Wan temporal VAE).")
     parser.add_argument("--num_inference_steps", type=int, default=50,
                         help="Number of denoising steps.")
@@ -106,7 +106,7 @@ def parse_args():
     # Output
     parser.add_argument("--save_path", type=str, required=True,
                         help="Directory for sampled clips, named <prompt>-<index>.mp4.")
-    parser.add_argument("--fps", type=int, default=24, help="Output video FPS.")
+    parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
 
     # Pre-parse only --config so the YAML can populate defaults before the real parse.

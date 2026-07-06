@@ -108,14 +108,12 @@ def parse_args():
     parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
                         help="Negative prompt (applied to every chunk).")
     parser.add_argument("--height", type=int, default=704, help="Output video height.")
-    parser.add_argument("--width", type=int, default=1248, help="Output video width.")
+    parser.add_argument("--width", type=int, default=1280, help="Output video width.")
 
     # Output
     parser.add_argument("--save_path", type=str, required=True,
                         help="Directory for sampled clips, named <prompt>-<index>.mp4.")
-    parser.add_argument("--output_name", type=str, required=True,
-                        help="Output video name.")
-    parser.add_argument("--fps", type=int, default=24, help="Output video FPS.")
+    parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
 
     # Pre-parse only --config so the YAML can populate defaults before the real parse.
