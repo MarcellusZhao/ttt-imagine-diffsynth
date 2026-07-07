@@ -37,7 +37,7 @@ model:
 train:
   learning_rate: 1.0e-5
   num_epochs: 1
-  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_acn_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16
+  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_gs2_acn_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16, con means the prediction step conditions on the last frame of the previous chunk, rank128 means the lora rank is 128, gs2 means the number of gradient steps is 2
   remove_prefix_in_ckpt: pipe.dit.
   use_gradient_checkpointing: true
 
@@ -65,7 +65,7 @@ e2e_ttt:
   # an unbounded count can OOM; set a positive value here (e.g. 4-8) as a memory cap.
   e2e_num_chunks: 0 # 0 = adaptive; positive = max cap
   e2e_frames_per_chunk: 41 # [13, 25, 37, 49]
-  e2e_num_gradient_steps: 1 
+  e2e_num_gradient_steps: 2
   e2e_num_mc_samples: 1
   e2e_inner_lr: 1.0e-4
   e2e_max_inner_grad_norm: 1.0
@@ -73,3 +73,10 @@ e2e_ttt:
   e2e_truncate_steps: []
   e2e_sigma_shift: 5.0
   e2e_first_order: true         # FOMAML: drop the Hessian term
+  # Match TI2V-5B inference, which generates each follow-up chunk conditioned on the
+  # previous chunk's last frame (fused VAE first-frame anchor). When true, chunks are
+  # sliced with a 1-frame overlap so each predict chunk's first frame is the previous
+  # chunk's last frame, that frame is pinned clean (timestep 0) in the predict loss, and
+  # excluded from supervision -- so training and inference optimise the same objective.
+  # The memorize step stays unconditioned, matching the test-time TTT update.
+  e2e_condition_on_last_frame: false
