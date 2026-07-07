@@ -2,7 +2,7 @@
 # E2E-TTT VBench inference config for Wan2.2-TI2V-5B.
 #
 # Run with:
-#   python examples/wanvideo/model_inference/Wan2.2-TI2V-5B-e2e-ttt-vbench.py \
+#   python examples/wanvideo/model_inference/vbench/Wan2.2-TI2V-5B-e2e-ttt-vbench.py \
 #       --config examples/wanvideo/model_inference/configs/Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml
 #
 # Sections are for readability only — just the leaf keys matter, and they must match
@@ -32,7 +32,7 @@ model:
 
 lora:
   # Path to the meta-trained phi_0 checkpoint produced by
-  # model_training/lora/Wan2.2-TI2V-5B-e2e-ttt.sh (MAML). Update to the run you want.
+  # model_training/lora/Wan2.2-TI2V-5B-e2e-ttt-fomaml.sh (FOMAML). Update to the run you want.
   # lora: /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors
   algorithm: fomaml                # maml / fomaml / reptile (provenance of the checkpoint)
   lora_rank: 32

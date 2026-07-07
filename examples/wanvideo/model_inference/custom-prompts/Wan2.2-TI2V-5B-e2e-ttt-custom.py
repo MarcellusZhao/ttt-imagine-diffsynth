@@ -9,7 +9,7 @@ TI2V-5B can also condition the first chunk on an image: pass --input_image (the
 remaining chunks continue purely from the adapted LoRA).
 
 Point --lora at a meta-trained LoRA phi_0 checkpoint (from
-`model_training/lora/Wan2.2-TI2V-5B-e2e-ttt.sh`).
+`model_training/lora/Wan2.2-TI2V-5B-e2e-ttt-fomaml.sh`).
 """
 
 import argparse

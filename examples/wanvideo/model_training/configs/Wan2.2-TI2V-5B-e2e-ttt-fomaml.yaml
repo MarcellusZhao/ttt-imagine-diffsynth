@@ -3,7 +3,7 @@
 #
 # Run with:
 #   accelerate launch examples/wanvideo/model_training/train_e2e_ttt.py \
-#       --config examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt.yaml
+#       --config examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml.yaml
 #
 # The 5B DiT is sharded across 3 safetensors files — passed as a NESTED list so they
 # load as a single DiT ModelConfig (same as the inference script's sorted(glob(...))).
