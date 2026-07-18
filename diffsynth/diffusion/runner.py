@@ -1,4 +1,4 @@
-import os, torch, importlib
+import os, math, torch, importlib
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
@@ -16,6 +16,23 @@ def get_optimizer_class(customized_optimizer=None):
         return getattr(module, class_name)
 
 
+def create_lr_scheduler(optimizer, lr_scheduler="constant", total_steps=None, warmup_steps=30, min_ratio=0.1):
+    if lr_scheduler == "constant":
+        return torch.optim.lr_scheduler.ConstantLR(optimizer)
+    elif lr_scheduler == "cosine_warmup":
+        warmup_steps = max(1, warmup_steps)
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            if total_steps is None or total_steps <= warmup_steps:
+                return 1.0
+            progress = min((step - warmup_steps) / (total_steps - warmup_steps), 1.0)
+            return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        raise ValueError(f"Unknown lr_scheduler `{lr_scheduler}`. Supported: `constant`, `cosine_warmup`.")
+
+
 def launch_training_task(
     accelerator: Accelerator,
     dataset: torch.utils.data.Dataset,
@@ -23,6 +40,9 @@ def launch_training_task(
     model_logger: ModelLogger,
     learning_rate: float = 1e-5,
     weight_decay: float = 1e-2,
+    lr_scheduler: str = "constant",
+    lr_warmup_steps: int = 30,
+    lr_min_ratio: float = 0.1,
     num_workers: int = 1,
     save_steps: int = None,
     num_epochs: int = 1,
@@ -36,6 +56,10 @@ def launch_training_task(
     if args is not None:
         learning_rate = args.learning_rate
         weight_decay = args.weight_decay
+        # getattr: direct callers may pass args objects predating these flags.
+        lr_scheduler = getattr(args, "lr_scheduler", lr_scheduler)
+        lr_warmup_steps = getattr(args, "lr_warmup_steps", lr_warmup_steps)
+        lr_min_ratio = getattr(args, "lr_min_ratio", lr_min_ratio)
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
@@ -46,16 +70,21 @@ def launch_training_task(
 
     optimizer_class = get_optimizer_class(customized_optimizer)
     optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
 
     if enable_model_cpu_offload:
-        optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
+        optimizer, dataloader = accelerator.prepare(optimizer, dataloader)
         model.pipe.device = accelerator.device
         offload_manager = OffloadTrainingManager(model, accelerator.device, enable_optimizer_cpu_offload, cpu_offload_split_threshold)
     else:
         model.to(device=accelerator.device)
-        model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+
+    # Built after prepare (and kept out of it) so the schedule advances exactly once per
+    # optimizer step on every rank: the prepared dataloader length is per-rank, and an
+    # accelerate-prepared scheduler would tick num_processes times per step instead.
+    total_steps = num_epochs * math.ceil(len(dataloader) / accelerator.gradient_accumulation_steps)
+    scheduler = create_lr_scheduler(optimizer, lr_scheduler, total_steps, lr_warmup_steps, lr_min_ratio)
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
@@ -86,7 +115,9 @@ def launch_training_task(
                             key = getattr(unwrapped, "grad_norm_log_key", "train/grad_norm")
                             unwrapped.log_metrics[key] = total_sq.sqrt()
                 optimizer.step()
-                scheduler.step()
+                # Advance only on real optimizer steps (accumulation micro-batches skip).
+                if accelerator.sync_gradients:
+                    scheduler.step()
                 optimizer.zero_grad()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss, lr=optimizer.param_groups[0]["lr"])
         if save_steps is None:

@@ -39,6 +39,9 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
     parser.add_argument("--customized_optimizer", type=str, default=None, help="Customized optimizer, e.g., `bitsandbytes.optim.Adam8bit` and `torch.optim.Adam`. The default optimizer is `torch.optim.AdamW`.")
+    parser.add_argument("--lr_scheduler", type=str, default="constant", choices=["constant", "cosine_warmup"], help="LR schedule for the outer optimizer. `cosine_warmup`: linear warmup for `lr_warmup_steps` optimizer steps, then cosine decay to `lr_min_ratio` * learning_rate over the rest of training.")
+    parser.add_argument("--lr_warmup_steps", type=int, default=30, help="Linear warmup length in optimizer steps. Only used when `lr_scheduler` is `cosine_warmup`.")
+    parser.add_argument("--lr_min_ratio", type=float, default=0.1, help="Cosine decay floor as a fraction of the peak learning rate. Only used when `lr_scheduler` is `cosine_warmup`.")
     return parser
 
 def add_output_config(parser: argparse.ArgumentParser):

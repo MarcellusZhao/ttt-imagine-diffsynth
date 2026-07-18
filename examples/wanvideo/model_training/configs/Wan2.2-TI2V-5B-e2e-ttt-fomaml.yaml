@@ -36,8 +36,15 @@ model:
 
 train:
   learning_rate: 1.0e-5
+  # Outer-loop (meta) LR schedule on the AdamW over phi_0: linear warmup for the first
+  # 30 optimizer steps, then cosine decay to lr_min_ratio * learning_rate by the end of
+  # training. The inner loop is untouched: e2e_inner_lr stays a fixed algorithm constant.
+  # Watch train/meta_lr in wandb to see the live schedule.
+  lr_scheduler: cosine_warmup
+  lr_warmup_steps: 30
+  lr_min_ratio: 0.1
   num_epochs: 1
-  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_gs2_acn_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16, con means the prediction step conditions on the last frame of the previous chunk, rank128 means the lora rank is 128, gs2 means the number of gradient steps is 2
+  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_cosine_lr_adamw_gs2_acn_uvl_fs_rsfps16_3k # acn is short for adaptive chunk number, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16, con means the prediction step conditions on the last frame of the previous chunk, rank128 means the lora rank is 128, gs2 means the number of gradient steps is 2
   remove_prefix_in_ckpt: pipe.dit.
   use_gradient_checkpointing: true
 
@@ -69,7 +76,7 @@ e2e_ttt:
   e2e_num_mc_samples: 1
   e2e_inner_lr: 1.0e-4
   e2e_max_inner_grad_norm: 1.0
-  e2e_inner_optimizer: sgd
+  e2e_inner_optimizer: adamw
   e2e_truncate_steps: []
   e2e_sigma_shift: 5.0
   e2e_first_order: true         # FOMAML: drop the Hessian term
