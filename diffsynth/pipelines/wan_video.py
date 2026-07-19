@@ -266,6 +266,9 @@ class WanVideoPipeline(BasePipeline):
         # progress_bar
         progress_bar_cmd=tqdm,
         output_type: Literal["quantized", "floatpoint"] = "quantized",
+        # E2E-TTT latent handoff: also return the sampler's final latents (pre-decode),
+        # so callers can memorize them directly instead of decode->re-encode round-tripping.
+        return_latents: bool = False,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
@@ -345,6 +348,9 @@ class WanVideoPipeline(BasePipeline):
         # post-denoising, pre-decoding processing logic
         for unit in self.post_units:
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        # The sampler's final latents, captured before VAE decode. Cloned so downstream
+        # decode / offload cannot mutate what the caller memorizes (E2E-TTT latent handoff).
+        final_latents = inputs_shared["latents"].clone() if return_latents else None
         # Decode
         self.load_models_to_device(['vae'])
         if framewise_decoding:
@@ -356,6 +362,8 @@ class WanVideoPipeline(BasePipeline):
         elif output_type == "floatpoint":
             pass
         self.load_models_to_device([])
+        if return_latents:
+            return video, final_latents
         return video
 
 

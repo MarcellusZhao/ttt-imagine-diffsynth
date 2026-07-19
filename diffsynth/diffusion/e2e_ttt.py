@@ -1062,16 +1062,6 @@ class WanE2ETTTSequentialGenerator:
         emb = WanVideoUnit_PromptEmbedder().encode_prompt(self.pipe, prompt)
         return emb.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
-    @torch.no_grad()
-    def _encode_video_to_latents(self, frames) -> torch.Tensor:
-        self.pipe.load_models_to_device(["vae"])
-        video = self.pipe.preprocess_video(frames)  # [1, C, T, H, W] in [-1, 1]
-        latents = self.pipe.vae.encode(
-            [video[0]], device=self.pipe.device,
-            tiled=self.infer_cfg.tiled,
-        ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-        return latents
-
     def generate(
         self,
         prompt: str,
@@ -1113,7 +1103,12 @@ class WanE2ETTTSequentialGenerator:
                 call_kwargs["input_image"] = cond_image
             call_kwargs.update(extra_call_kwargs)
 
-            frames = self.pipe(**call_kwargs)
+            # Latent handoff: ask the pipeline for the sampler's final latents alongside
+            # the decoded frames. We memorize these latents directly (below) instead of
+            # decode->re-encode, which skips a VAE encode per chunk and avoids the VAE
+            # round-trip reconstruction error -- the memorized x0 is exactly what the
+            # sampler produced.
+            frames, chunk_latents = self.pipe(**call_kwargs, return_latents=True)
             # The first frame of a follow-up chunk reproduces the anchor frame; drop it
             # to avoid a duplicate-frame seam at the chunk boundary.
             if k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
@@ -1130,8 +1125,9 @@ class WanE2ETTTSequentialGenerator:
             if k == icfg.num_chunks - 1:
                 continue
 
-            # Memorize the chunk we just generated.
-            x0 = self._encode_video_to_latents(frames)
+            # Memorize the chunk we just generated -- straight from the sampler's final
+            # latents (no VAE decode->re-encode round-trip).
+            x0 = chunk_latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
             context = self._encode_prompt(prompt)
             self.pipe.load_models_to_device(["dit"])
             for step in range(max(1, int(icfg.ttt_steps_per_chunk))):
