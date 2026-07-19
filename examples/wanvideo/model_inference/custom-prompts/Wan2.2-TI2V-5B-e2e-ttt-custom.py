@@ -58,6 +58,9 @@ def parse_args():
                         help="Comma-separated module name patterns to inject LoRA into.")
 
     # Inner-loop (memorization) config
+    parser.add_argument("--optimizer", type=str, default="sgd",
+                        choices=["sgd", "adamw", "muon", "muonclip"],
+                        help="Differentiable inner-loop optimizer for the memorization update.")
     parser.add_argument("--num_gradient_steps", type=int, default=1,
                         help="Inner-loop gradient steps per memorization.")
     parser.add_argument("--num_mc_samples", type=int, default=1,
@@ -133,6 +136,7 @@ def main():
         num_mc_samples=args.num_mc_samples,
         inner_lr_init=args.inner_lr_init,
         max_inner_grad_norm=args.max_inner_grad_norm,
+        optimizer=args.optimizer,
     )
     infer_cfg = InferenceConfig(
         num_chunks=args.num_chunks,
