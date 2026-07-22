@@ -33,6 +33,7 @@ Targets ``Wan2.1-T2V-1.3B`` and ``Wan2.2-TI2V-5B`` (single-DiT Wan pipelines).
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -502,6 +503,337 @@ def make_training_scheduler(sigma_shift: float = 5.0) -> FlowMatchScheduler:
     return sched
 
 
+# --------------------------------------------------------------------------- #
+# Recycled-error buffers (anti-drift), following Stable-Video-Infinity          #
+# --------------------------------------------------------------------------- #
+
+
+class ErrorRecycler:
+    """Recycled-error buffers following Stable-Video-Infinity (arXiv:2510.09212;
+    reference implementation ``Stable-Video-Infinity/train_svi.py``), adapted to
+    E2E-TTT meta-training.
+
+    Anti-drift idea (SVI): at test time the model conditions on -- and, in E2E-TTT,
+    *memorizes* -- its own imperfect outputs, but vanilla training only ever sees
+    clean ground-truth chunks. This module harvests the model's real prediction
+    errors during training into timestep-bucketed buffers and re-injects them into
+    training inputs. How the target is treated depends on which objective is being
+    corrupted -- this is where E2E-TTT departs from SVI's single training step:
+
+      * MEMORIZE (inner/TTT) loss, gated by ``latent_prob``: the chunk is corrupted
+        CONSISTENTLY (input and target), replicating the test-time
+        ``ttt_update_inplace``, whose target is built from the generated --
+        corrupted -- chunk (no clean data exists at inference). The anti-drift
+        signal comes from the OUTER loop: phi_0 is meta-shaped so that memorizing
+        corrupted chunks still predicts clean ones.
+      * PREDICT (generation/meta) loss, gated by ``noise_prob``/``latent_prob``:
+        SVI's asymmetric scheme -- corrupted inputs, CLEAN target -- teaching the
+        adapted model to self-correct mid-trajectory sampling errors; plus the
+        ``y_prob``-gated anchor-frame injection (SVI's y-error), simulating the
+        drifted previous-chunk frame the anchor actually is at inference.
+
+    Mirrors SVI's ``LightningModelForTrain_onestage`` buffer machinery:
+      * two buffers, harvested via the two one-shot ``step(..., to_final=True)``
+        extrapolations (SVI train_svi.py:1151-1160): ``noise_error_buffer`` holds
+        noise-direction errors (SVI's ``latent_error_buffer``) and
+        ``y_error_buffer`` holds data-direction errors (SVI's ``y_error_buffer``);
+      * ``num_grids`` buckets keyed by the nearest timestep of a simulated
+        ``num_grids``-step inference schedule (SVI's ``_get_timestep_grid``), so
+        injected errors match the errors made at that point of a real sampling
+        trajectory;
+      * random-replacement eviction (SVI's default ``buffer_replacement_strategy``);
+      * independent injection gates ``noise_prob`` / ``latent_prob`` / ``y_prob``
+        plus a ``clean_prob`` override that forces a fully clean step;
+      * intensity modulation by ``uniform(1-f, 1+f)`` (``error_modulate_factor``).
+
+    Simplifications vs SVI (all safe to revisit later):
+      * NO ``all_gather`` warmup -- buffers are per-process and filled from local
+        errors only. ``buffer_warmup_iter`` instead gates when *injection* starts,
+        so the first few outer steps only collect. E2E-TTT harvests
+        ``num_mem_steps x num_mc_samples`` errors per outer step (vs SVI's 1), so
+        local buckets fill quickly without cross-GPU sync.
+      * only the random replacement strategy (SVI's default and fastest).
+
+    CPU memory = 2 buffers x num_grids x error_buffer_k x one chunk-latent tensor
+    (e.g. ~2 MB for a TI2V-5B 21-frame 704x1280 chunk -> ~6 GB at 50 x 32).
+    """
+
+    def __init__(
+        self,
+        num_grids: int = 50,
+        error_buffer_k: int = 32,
+        buffer_warmup_iter: int = 20,
+        noise_prob: float = 0.9,
+        latent_prob: float = 0.9,
+        y_prob: float = 0.9,
+        clean_prob: float = 0.1,
+        error_modulate_factor: float = 0.0,
+        sigma_shift: float = 5.0,
+        anchor_sample_from_all_grids: bool = True,
+    ):
+        # Simulated inference schedule: one grid per inference timestep (SVI builds
+        # this with get_timesteps(num_inference_steps=num_grids, shift=5.0)).
+        sigmas, timesteps = FlowMatchScheduler.set_timesteps_wan(
+            num_inference_steps=int(num_grids), shift=float(sigma_shift),
+        )
+        self.inference_sigmas = sigmas        # [num_grids], descending
+        self.inference_timesteps = timesteps  # [num_grids], = sigmas * 1000
+        self.error_buffer_size = int(error_buffer_k)
+        self.buffer_warmup_iter = int(buffer_warmup_iter)
+        self.noise_prob = float(noise_prob)
+        self.latent_prob = float(latent_prob)
+        self.y_prob = float(y_prob)
+        self.clean_prob = float(clean_prob)
+        self.error_modulate_factor = float(error_modulate_factor)
+        num_grids = len(timesteps)
+        # SVI naming note: SVI's `latent_error_buffer` stores the noise-direction
+        # errors and feeds the *noise* injection; its `y_error_buffer` stores the
+        # data-direction errors and feeds both the *latent* and *y* injections.
+        # We name the first one `noise_error_buffer` for clarity.
+        self.noise_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
+        self.y_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
+        # Dedicated SINGLE-FRAME anchor-error buffer. At inference the anchor is the
+        # previous chunk's *last generated frame*, so its drift is a terminal, data-space
+        # error of one frame -- a different distribution from the mid-trajectory,
+        # full-chunk data errors in `y_error_buffer`. We harvest it separately from the
+        # predict step's LAST frame (the frame that becomes the next anchor) and inject a
+        # single-frame slice into the pinned anchor. Kept apart from the full-chunk buffers
+        # so its shape ([B,C,1,H,W]) never collides with the full-chunk latent injections.
+        self.anchor_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
+        # Anchor drift is terminal (data-space, timestep-independent), so it is not tied to
+        # the current denoising timestep: sampling from any grid maximises buffer use.
+        self.anchor_sample_from_all_grids = bool(anchor_sample_from_all_grids)
+        self.iteration_count = 0
+        self.num_harvested = 0
+        # --- diagnostics surfaced via stats() (all cheap running scalars) ---
+        # #1 harvested error RMS (per-element root-mean-square, comparable across the
+        #    different-size buffers) accumulated per buffer type.
+        self._harv_rms_sum = {"noise": 0.0, "y": 0.0, "anchor": 0.0}
+        self._harv_rms_cnt = {"noise": 0, "y": 0, "anchor": 0}
+        # #2 injection attempts vs successes per type -- a miss (empty grid or shape
+        #    mismatch) silently injects nothing, so miss_rate flags anti-drift going inert.
+        self._inj_req = {"noise": 0, "y": 0, "anchor": 0}
+        self._inj_ok = {"noise": 0, "y": 0, "anchor": 0}
+        # #3 relative corruption strength ||err|| / ||x0|| per type (summed over successes).
+        self._inj_rel_sum = {"noise": 0.0, "y": 0.0, "anchor": 0.0}
+        # #4 harvest events split by objective (confirms predict-side harvesting fires).
+        self.num_harvested_memorize = 0
+        self.num_harvested_predict = 0
+
+    def begin_iteration(self) -> None:
+        """Call once per outer training step; drives the injection warmup gate."""
+        self.iteration_count += 1
+
+    @property
+    def inject_active(self) -> bool:
+        """Injection starts only after the warmup iterations (collection-only phase)."""
+        return self.iteration_count > self.buffer_warmup_iter
+
+    def _get_timestep_grid(self, timestep) -> int:
+        """Grid index for a timestep: nearest inference timestep (SVI's version)."""
+        if isinstance(timestep, torch.Tensor):
+            timestep_val = timestep.flatten()[0].item()
+        else:
+            timestep_val = float(timestep)
+        timestep_val = max(0.0, min(timestep_val, 999.0))
+        grid_idx = torch.argmin((self.inference_timesteps - timestep_val).abs()).item()
+        return int(grid_idx)
+
+    def _add_error_to_buffer(self, buffer: Dict[int, List[torch.Tensor]], error_sample: torch.Tensor, timestep, tag: str) -> None:
+        """Random-replacement insertion (SVI's `_add_error_to_latent_buffer`, 'random')."""
+        grid_idx = self._get_timestep_grid(timestep)
+        # #1 harvested error scale, as per-element RMS so noise/y/anchor are comparable.
+        self._harv_rms_sum[tag] += float(error_sample.detach().float().pow(2).mean().sqrt())
+        self._harv_rms_cnt[tag] += 1
+        error_cpu = error_sample.detach().cpu()
+        bucket = buffer[grid_idx]
+        if len(bucket) < self.error_buffer_size:
+            bucket.append(error_cpu)
+        else:
+            bucket[random.randint(0, len(bucket) - 1)] = error_cpu
+        self.num_harvested += 1
+
+    def _record_injection(self, tag: str, err: torch.Tensor, like: torch.Tensor) -> None:
+        """Log a successful injection: count it (#2) and its relative strength (#3)."""
+        self._inj_ok[tag] += 1
+        denom = float(like.detach().float().norm()) + 1e-8
+        self._inj_rel_sum[tag] += float(err.detach().float().norm()) / denom
+
+    def _sample_error_from_buffer(self, buffer: Dict[int, List[torch.Tensor]], timestep, like: torch.Tensor, tag: str) -> Optional[torch.Tensor]:
+        """Random sample from the current timestep grid, intensity-modulated
+        (SVI's `_sample_noise_error_from_noise_buffer`). None if the grid is empty
+        or the stored shape does not match (mixed-resolution datasets)."""
+        self._inj_req[tag] += 1  # #2 count the attempt (miss = returns None below)
+        grid_idx = self._get_timestep_grid(timestep)
+        bucket = buffer[grid_idx]
+        if not bucket:
+            return None
+        error_sample = random.choice(bucket)
+        if error_sample.shape != like.shape:
+            return None
+        error_sample = error_sample.to(device=like.device, dtype=like.dtype)
+        intensity_mod = random.uniform(1.0 - self.error_modulate_factor, 1.0 + self.error_modulate_factor)
+        error_sample = error_sample * intensity_mod
+        self._record_injection(tag, error_sample, like)
+        return error_sample
+
+    def _sample_error_from_any_grid(self, buffer: Dict[int, List[torch.Tensor]], like: torch.Tensor, tag: str) -> Optional[torch.Tensor]:
+        """Like ``_sample_error_from_buffer`` but pooled across ALL non-empty grids
+        (SVI's ``y_error_sample_from_all_grids``). Used for the anchor error, whose
+        terminal/data-space drift is not tied to the current denoising timestep."""
+        self._inj_req[tag] += 1  # #2 count the attempt (miss = returns None below)
+        pooled = [s for bucket in buffer.values() for s in bucket if s.shape == like.shape]
+        if not pooled:
+            return None
+        error_sample = random.choice(pooled).to(device=like.device, dtype=like.dtype)
+        intensity_mod = random.uniform(1.0 - self.error_modulate_factor, 1.0 + self.error_modulate_factor)
+        error_sample = error_sample * intensity_mod
+        self._record_injection(tag, error_sample, like)
+        return error_sample
+
+    @torch.no_grad()
+    def harvest(self, scheduler: FlowMatchScheduler, noise_pred: torch.Tensor, training_target: torch.Tensor, noisy_latents: torch.Tensor, timestep, *, condition_on_first_frame: bool = False, source: Optional[str] = None) -> None:
+        """Harvest the model's one-shot extrapolation errors (SVI train_svi.py:1151-1160).
+
+        SVI computes both errors with `scheduler.step(..., to_final=True, self_corr=...)`;
+        DiffSynth's FlowMatchScheduler.step has no `self_corr` branch, so the two
+        one-shot jumps are inlined here: self_corr=True ends at the noise end
+        (sigma_=1), self_corr=False at the data end (sigma_=0).
+
+        ``condition_on_first_frame`` (predict objective with the fused first-frame anchor):
+        latent frame 0 is the pinned anchor -- fed at timestep 0 as clean context, never
+        denoised, and excluded from the loss -- so its slice of ``noisy_latents`` sits at
+        sigma~=0, not the sampled ``sigma``, making its extrapolated "error" numerically
+        meaningless (and possibly carrying the injected anchor y-error). We therefore zero
+        frame 0 in the full-chunk errors, and route the model's genuine terminal error on
+        the chunk's LAST frame -- the frame that becomes the next chunk's anchor at
+        inference -- into the dedicated single-frame ``anchor_error_buffer``.
+        """
+        if source == "memorize":
+            self.num_harvested_memorize += 1  # #4 objective split
+        elif source == "predict":
+            self.num_harvested_predict += 1
+        t = timestep.cpu() if isinstance(timestep, torch.Tensor) else timestep
+        timestep_id = torch.argmin((scheduler.timesteps - t).abs())
+        sigma = float(scheduler.sigmas[timestep_id])
+        noise_pred = noise_pred.detach()
+        training_target = training_target.detach()
+        noisy_latents = noisy_latents.detach()
+
+        x_0_pred = noisy_latents + noise_pred * (1.0 - sigma)
+        noise_corr_gt = noisy_latents + training_target * (1.0 - sigma)
+        noise_error = x_0_pred - noise_corr_gt
+
+        x_1_pred = noisy_latents + noise_pred * (0.0 - sigma)
+        latent_corr_gt = noisy_latents + training_target * (0.0 - sigma)
+        y_error = x_1_pred - latent_corr_gt
+
+        if condition_on_first_frame and y_error.shape[2] >= 2:
+            # The last frame's data-direction error is the terminal error of a frame
+            # generated from a (possibly drifted) context -- exactly the anchor drift.
+            self._add_error_to_buffer(self.anchor_error_buffer, y_error[:, :, -1:], timestep, "anchor")
+            # Frame 0 is the pinned anchor: its extrapolated error is garbage, so keep the
+            # full-chunk buffers uniform in shape by zeroing it rather than dropping it.
+            noise_error = noise_error.clone(); noise_error[:, :, 0:1] = 0
+            y_error = y_error.clone(); y_error[:, :, 0:1] = 0
+
+        self._add_error_to_buffer(self.noise_error_buffer, noise_error, timestep, "noise")
+        self._add_error_to_buffer(self.y_error_buffer, y_error, timestep, "y")
+
+    @torch.no_grad()
+    def sample_noise_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
+        """Noise-direction error for `noise = noise + err` injection."""
+        return self._sample_error_from_buffer(self.noise_error_buffer, timestep, like, "noise")
+
+    @torch.no_grad()
+    def sample_latent_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
+        """Data-direction error for `latents = latents + err` injection (SVI samples
+        this from the y_error buffer -- see `_sample_latent_error_from_latent_buffer`)."""
+        return self._sample_error_from_buffer(self.y_error_buffer, timestep, like, "y")
+
+    @torch.no_grad()
+    def sample_anchor_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
+        """Single-frame terminal error for the anchor ('y') injection, drawn from the
+        dedicated ``anchor_error_buffer`` (harvested from the predict step's last frame).
+        ``like`` is the single pinned anchor frame ([B,C,1,H,W]).
+
+        Probability gating is handled together with the noise/latent gates in
+        ``draw_injection_flags`` so ``clean_prob`` can force the entire prediction
+        draw -- including its anchor -- to stay clean.
+        """
+        if self.anchor_sample_from_all_grids:
+            return self._sample_error_from_any_grid(self.anchor_error_buffer, like, "anchor")
+        return self._sample_error_from_buffer(self.anchor_error_buffer, timestep, like, "anchor")
+
+    def draw_injection_flags(self) -> Dict[str, bool]:
+        """Per-draw injection decision for the GENERATION (predict) objective
+        (SVI train_svi.py:1090-1111): independent noise/latent/y gates, overridden
+        to all-clean with prob `clean_prob`."""
+        if not self.inject_active:
+            return {"noise": False, "latent": False, "y": False}
+        flags = {
+            "noise": random.random() < self.noise_prob,
+            "latent": random.random() < self.latent_prob,
+            "y": random.random() < self.y_prob,
+        }
+        if random.random() < self.clean_prob:
+            flags = {"noise": False, "latent": False, "y": False}
+        return flags
+
+    def draw_memorize_injection(self) -> bool:
+        """Per-draw injection decision for the MEMORIZE (inner/TTT) objective:
+        corrupt the memorized chunk itself with prob `latent_prob`, overridden to
+        clean with prob `clean_prob`. Unlike the generation gates, this corruption
+        is CONSISTENT (input and target), replicating the test-time TTT update,
+        which builds its target from the generated -- corrupted -- chunk."""
+        if not self.inject_active:
+            return False
+        if random.random() >= self.latent_prob:
+            return False
+        if random.random() < self.clean_prob:
+            return False
+        return True
+
+    def stats(self) -> Dict[str, float]:
+        out = {
+            "err_buffer/noise_nonempty_grids": float(sum(1 for v in self.noise_error_buffer.values() if v)),
+            "err_buffer/y_nonempty_grids": float(sum(1 for v in self.y_error_buffer.values() if v)),
+            "err_buffer/anchor_nonempty_grids": float(sum(1 for v in self.anchor_error_buffer.values() if v)),
+            "err_buffer/anchor_samples": float(sum(len(v) for v in self.anchor_error_buffer.values())),
+            "err_buffer/total_samples": float(
+                sum(len(v) for v in self.noise_error_buffer.values())
+                + sum(len(v) for v in self.y_error_buffer.values())
+                + sum(len(v) for v in self.anchor_error_buffer.values())
+            ),
+            "err_buffer/num_harvested": float(self.num_harvested),
+            "err_buffer/num_injected": float(sum(self._inj_ok.values())),
+            "err_buffer/inject_active": float(self.inject_active),
+        }
+        for t in ("noise", "y", "anchor"):
+            # #1 mean harvested error scale (per-element RMS). Watch for upward drift
+            #    (feedback) or collapse to 0 (converged / injection inert). Expect
+            #    anchor >= y (terminal error > one-step error).
+            out[f"err_buffer/harv_rms_{t}"] = self._harv_rms_sum[t] / max(1, self._harv_rms_cnt[t])
+            # #2 injection miss rate: attempts that found no matching sample and injected
+            #    nothing. High => anti-drift silently off for that buffer. 0 when no attempts.
+            out[f"err_buffer/miss_rate_{t}"] = (
+                1.0 - self._inj_ok[t] / self._inj_req[t] if self._inj_req[t] else 0.0
+            )
+            # #3 mean relative corruption strength ||err|| / ||x0|| over successful injects.
+            out[f"err_buffer/inject_rel_{t}"] = self._inj_rel_sum[t] / max(1, self._inj_ok[t])
+        total_req = sum(self._inj_req.values())
+        out["err_buffer/miss_rate"] = (
+            1.0 - sum(self._inj_ok.values()) / total_req if total_req else 0.0
+        )
+        # #4 harvest source split -- confirms the predict-side harvest actually fires
+        #    (if ~0, the anchor buffer and compounding errors never fill).
+        out["err_buffer/num_harvested_memorize"] = float(self.num_harvested_memorize)
+        out["err_buffer/num_harvested_predict"] = float(self.num_harvested_predict)
+        tot_h = self.num_harvested_memorize + self.num_harvested_predict
+        out["err_buffer/predict_harvest_frac"] = self.num_harvested_predict / tot_h if tot_h else 0.0
+        return out
+
+
 @contextlib.contextmanager
 def _override_checkpointed_blocks(dit, params_override):
     """Run each DiT block under activation checkpointing while keeping the LoRA
@@ -589,6 +921,11 @@ def compute_flow_matching_loss(
     use_gradient_checkpointing: bool = False,
     condition_on_first_frame: bool = False,
     dit=None,
+    error_recycler: Optional[ErrorRecycler] = None,
+    inject_memorize_error: bool = False,
+    inject_generation_error: bool = False,
+    inject_anchor_error: bool = False,
+    harvest_errors: bool = False,
 ) -> torch.Tensor:
     """Rectified flow-matching loss matching DiffSynth's ``FlowMatchSFTLoss``.
 
@@ -634,18 +971,99 @@ def compute_flow_matching_loss(
         timestep_id = torch.randint(min_ts, max_ts, (1,))
         timestep = scheduler.timesteps[timestep_id].to(dtype=dtype, device=device)
         noise = torch.randn_like(x0)
-        latents = scheduler.add_noise(x0, noise, timestep)
-        target = scheduler.training_target(x0, noise, timestep)
+        # --- Error recycling. All injected tensors are detached buffer samples --
+        # pure data perturbation, invisible to the (second-order) meta-graph.
+        # Two distinct injection modes:
+        #
+        # (1) inject_memorize_error (inner/TTT objective): corrupt the memorized
+        #     chunk itself, CONSISTENTLY (input and target). At test time
+        #     ttt_update_inplace builds its target from the generated -- corrupted --
+        #     chunk; there is no clean x0 there, so the meta-trained inner update
+        #     must see the same fully-corrupted loss it will run at inference.
+        #     Fresh clean Gaussian noise, exactly like the test-time update.
+        #
+        # (2) inject_generation_error (predict/meta objective): SVI's asymmetric
+        #     scheme (train_svi.py:1114-1139) -- corrupt the noise and/or the
+        #     add_noise input while the target keeps pointing at the CLEAN chunk,
+        #     so the learned velocity corrects mid-trajectory sampling errors.
+        injected_this_draw = False
+        # Tracked apart from injected_this_draw because it alone contaminates the harvest:
+        # noise injection puts the recycled error into the TARGET (target = noise_w_error -
+        # x0), so re-harvesting would algebraically re-deposit it. Latent/anchor injection
+        # corrupts only the INPUT, so its residual is a genuine corrupted-input (compounding)
+        # error -- safe, and exactly the train-test-matching signal we want to collect.
+        noise_injected_this_draw = False
+        injection_flags = {"noise": False, "latent": False, "y": False}
+        if error_recycler is not None and (inject_generation_error or inject_anchor_error):
+            # Draw all prediction-side gates together so a single clean_prob
+            # override also keeps the conditioning anchor clean.
+            injection_flags = error_recycler.draw_injection_flags()
+        x0_used = x0
+        if error_recycler is not None and inject_memorize_error and error_recycler.draw_memorize_injection():
+            err = error_recycler.sample_latent_error(timestep, like=x0)
+            if err is not None:
+                x0_used = x0 + err  # the chunk as it would arrive at test time
+                injected_this_draw = True
+        noise_w_error, latents_w_error = noise, x0_used
+        if error_recycler is not None and inject_generation_error:
+            if injection_flags["noise"]:
+                err = error_recycler.sample_noise_error(timestep, like=x0)
+                if err is not None:
+                    noise_w_error = noise + err
+                    injected_this_draw = True
+                    noise_injected_this_draw = True
+            if injection_flags["latent"]:
+                err = error_recycler.sample_latent_error(timestep, like=x0)
+                if err is not None:
+                    latents_w_error = latents_w_error + err
+                    injected_this_draw = True
+        latents = scheduler.add_noise(latents_w_error, noise_w_error, timestep)
+        # Memorize: target follows x0_used (corrupted chunk -> corrupted target,
+        # test-time-faithful). Predict: x0_used == x0, so the target stays clean
+        # even under generation-error injection (SVI's self-correcting supervision).
+        target = scheduler.training_target(x0_used, noise_w_error, timestep)
         if condition_on_first_frame:
             # Pin the first latent frame to the clean anchor (no noise), exactly as the
             # inference pipeline re-clamps latents[:, :, 0:1] = first_frame_latents.
-            latents = torch.cat([x0[:, :, 0:1], latents[:, :, 1:]], dim=2)
+            anchor = x0[:, :, 0:1]
+            if error_recycler is not None and inject_anchor_error and injection_flags["y"]:
+                # SVI's y-error injection (train_svi.py:1118-1130): corrupt the
+                # conditioning frame with a recycled terminal single-frame error,
+                # simulating the drifted previous-chunk frame the anchor actually is at
+                # inference. Drawn from the dedicated anchor buffer (last-frame terminal
+                # errors), not the mid-trajectory full-chunk y buffer. Supervision stays clean.
+                a_err = error_recycler.sample_anchor_error(timestep, like=anchor)
+                if a_err is not None:
+                    anchor = anchor + a_err
+            latents = torch.cat([anchor, latents[:, :, 1:]], dim=2)
         noise_pred = _model_fn_with_override(
             pipe, dit, params_override,
             latents=latents, timestep=timestep, context=context,
             use_gradient_checkpointing=gc,
             fuse_vae_embedding_in_latents=condition_on_first_frame,
         )
+        if error_recycler is not None and harvest_errors:
+            # Recycle this draw's own prediction error into the buffers (SVI
+            # train_svi.py:1151-1160). Free: no extra forward pass. What is safe to
+            # harvest differs by objective:
+            if inject_memorize_error and not injected_this_draw:
+                # MEMORIZE: clean draws only. Consistent corruption makes the target
+                # (noise - x0_used) algebraically re-deposit the injected error, and the
+                # inner loss that would damp it acts on discarded adapted weights under a
+                # non-meta objective -- so injected memorize draws would contaminate the
+                # buffers. Unconditioned (no anchor frame in the memorize objective).
+                error_recycler.harvest(scheduler, noise_pred, target, latents, timestep, source="memorize")
+            elif inject_generation_error and not noise_injected_this_draw:
+                # PREDICT: harvest genuine corrupted-input (compounding) errors -- the
+                # drifted-input regime the buffers otherwise never see. The asymmetric
+                # target is built from CLEAN x0, so latent/anchor injection (input-only)
+                # leaves no algebraic residue; only NOISE injection leaks into the target,
+                # so those draws are skipped. condition_on_first_frame routes the last
+                # frame's terminal error to the anchor buffer and drops the pinned frame 0.
+                error_recycler.harvest(
+                    scheduler, noise_pred, target, latents, timestep,
+                    condition_on_first_frame=condition_on_first_frame, source="predict",
+                )
         if condition_on_first_frame:
             # The anchor frame is given (timestep 0), not predicted -- supervise only the
             # continuation frames, matching what the model actually generates at inference.
@@ -691,6 +1109,7 @@ def _run_reptile_inner_loop(
     learned_lrs: Optional[MetaLearnedLRSchedule] = None,
     use_gradient_checkpointing: bool = False,
     write_back: bool = False,
+    error_recycler: Optional[ErrorRecycler] = None,
 ):
     """Reptile meta-update.
 
@@ -737,6 +1156,8 @@ def _run_reptile_inner_loop(
                     pipe, scheduler, chunks[k], ctx, inner_cfg,
                     params_override={**current},
                     use_gradient_checkpointing=use_gradient_checkpointing,
+                    error_recycler=error_recycler,
+                    inject_memorize_error=True, harvest_errors=True,
                 )
                 mem_loss_sum = mem_loss_sum + loss_mem.detach()
                 mem_count += 1
@@ -792,6 +1213,7 @@ def run_meta_inner_loop(
     write_back: bool = False,
     algorithm: Optional[str] = None,
     condition_on_first_frame: bool = False,
+    error_recycler: Optional[ErrorRecycler] = None,
 ):
     """Memorize->predict inner loop over chunk sequences (MAML / FOMAML / Reptile).
 
@@ -817,6 +1239,9 @@ def run_meta_inner_loop(
     unconditioned, matching the test-time ``ttt_update_inplace``.
     """
     algorithm = (algorithm or getattr(inner_cfg, "algorithm", "maml")).lower()
+    if error_recycler is not None:
+        # One outer step per call (batch of one video per rank); drives the warmup gate.
+        error_recycler.begin_iteration()
     if algorithm == "reptile":
         # Reptile has no predict term -- it only ever runs the (unconditioned) memorize
         # objective -- so first-frame conditioning does not apply and is ignored here.
@@ -825,6 +1250,7 @@ def run_meta_inner_loop(
             learned_lrs=learned_lrs,
             use_gradient_checkpointing=use_gradient_checkpointing,
             write_back=write_back,
+            error_recycler=error_recycler,
         )
     first_order = algorithm != "maml"  # FOMAML drops the Hessian
     truncate_steps = truncate_steps or []
@@ -867,10 +1293,18 @@ def run_meta_inner_loop(
             # ---- memorize chunk k ----
             for _ in range(max(1, int(inner_cfg.num_gradient_steps))):
                 params_override = {**current_lora}
+                # Memorize with recycled errors corrupting the chunk CONSISTENTLY
+                # (input and target), replicating the test-time TTT update, which
+                # builds its target from the generated -- corrupted -- chunk. The
+                # anti-drift signal comes from the outer loop: phi_0 is meta-shaped
+                # so that memorizing corrupted chunks still predicts clean ones.
+                # Clean draws' residuals are harvested back into the buffers.
                 loss_mem = compute_flow_matching_loss(
                     pipe, scheduler, chunks[k], ctx, inner_cfg,
                     params_override=params_override,
                     use_gradient_checkpointing=use_gradient_checkpointing,
+                    error_recycler=error_recycler,
+                    inject_memorize_error=True, harvest_errors=True,
                 )
                 mem_loss_sum = mem_loss_sum + loss_mem.detach()
                 mem_count += 1
@@ -896,11 +1330,25 @@ def run_meta_inner_loop(
             # first-frame conditioning on the previous chunk's last frame; with overlap
             # chunking that anchor IS chunks[k+1]'s first frame, so condition the predict
             # loss on it to match the inference-time objective (see compute_flow_matching_loss).
+            # The predict (meta) loss carries SVI's generation-side error recycling:
+            # noise/latent errors corrupt the inputs while the TARGET stays clean
+            # (predict defines what "good" means), teaching the adapted model to
+            # self-correct mid-trajectory sampling errors. The pinned anchor frame
+            # -- a *generated* frame at inference -- additionally gets SVI's y-error
+            # injection, so phi_0 is meta-learned under realistic anchor corruption.
             loss_pred = compute_flow_matching_loss(
                 pipe, scheduler, chunks[k + 1], ctx, inner_cfg,
                 params_override={**current_lora},
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 condition_on_first_frame=condition_on_first_frame,
+                error_recycler=error_recycler,
+                inject_generation_error=True,
+                inject_anchor_error=condition_on_first_frame,
+                # Harvest the predict step's genuine corrupted-input (compounding) errors:
+                # full-chunk noise/data errors into the shared buffers and the last frame's
+                # terminal error into the anchor buffer. Noise-injected draws are skipped
+                # inside compute_flow_matching_loss (their error leaks into the target).
+                harvest_errors=True,
             )
             meta_loss = meta_loss + loss_pred
             num_pred += 1

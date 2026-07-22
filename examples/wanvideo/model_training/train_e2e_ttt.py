@@ -26,6 +26,7 @@ from diffsynth.diffusion import *
 from diffsynth.diffusion.e2e_ttt import (
     InnerLoopConfig, ChunkingConfig, make_training_scheduler, run_meta_inner_loop,
     count_lora_params, enable_double_backward_attention, get_lora_params,
+    ErrorRecycler,
 )
 
 # Reuse the vanilla module so all the model-loading / LoRA-injection plumbing is shared.
@@ -52,6 +53,16 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_algorithm="maml",
         e2e_first_order=False,
         e2e_condition_on_last_frame=True,
+        e2e_use_error_recycling=False,
+        e2e_num_grids=50,
+        e2e_error_buffer_k=32,
+        e2e_buffer_warmup_iter=20,
+        e2e_noise_prob=0.9,
+        e2e_latent_prob=0.9,
+        e2e_y_prob=0.9,
+        e2e_clean_prob=0.1,
+        e2e_error_modulate_factor=0.0,
+        e2e_anchor_sample_from_all_grids=True,
         outer_lr=None,
         **kwargs,
     ):
@@ -116,6 +127,27 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             print("[E2E-TTT] NOTE: this DiT has no fused first-frame conditioning "
                   "(fuse_vae_embedding_in_latents); training without last-frame conditioning "
                   "(contiguous, non-overlapping chunks). This is expected for Wan2.1-T2V.")
+        # SVI-style recycled-error buffers for anti-drift (arXiv:2510.09212). Per-process
+        # only (no all_gather); the warmup iterations are collection-only, then recycled
+        # errors are injected into the memorize inputs and the predict anchor frame.
+        self.error_recycler = None
+        if e2e_use_error_recycling:
+            self.error_recycler = ErrorRecycler(
+                num_grids=int(e2e_num_grids),
+                error_buffer_k=int(e2e_error_buffer_k),
+                buffer_warmup_iter=int(e2e_buffer_warmup_iter),
+                noise_prob=float(e2e_noise_prob),
+                latent_prob=float(e2e_latent_prob),
+                y_prob=float(e2e_y_prob),
+                clean_prob=float(e2e_clean_prob),
+                error_modulate_factor=float(e2e_error_modulate_factor),
+                sigma_shift=float(e2e_sigma_shift),
+                anchor_sample_from_all_grids=bool(e2e_anchor_sample_from_all_grids),
+            )
+            print(f"[E2E-TTT] error recycling ON | grids={e2e_num_grids} x k={e2e_error_buffer_k} | "
+                  f"warmup={e2e_buffer_warmup_iter} iters | probs noise/latent/y/clean="
+                  f"{e2e_noise_prob}/{e2e_latent_prob}/{e2e_y_prob}/{e2e_clean_prob} | "
+                  f"modulate={e2e_error_modulate_factor}")
         _chunks_desc = ("adaptive" if self.chunk_cfg.num_chunks is None
                         else f"<={self.chunk_cfg.num_chunks}")
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
@@ -274,6 +306,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             write_back=False,
             algorithm=self.inner_cfg.algorithm,
             condition_on_first_frame=self.condition_on_last_frame,
+            error_recycler=self.error_recycler,
         )
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
         # `meta_loss` is logged separately as the generic "loss"; these add the MAML-specific
@@ -299,6 +332,12 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             # (TI2V-5B fused first-frame anchor), matching inference; 0.0 otherwise.
             "train/condition_on_last_frame": float(self.condition_on_last_frame),
         }
+        # Recycled-error buffer fill/injection counters (per-process; rank 0 is logged).
+        # Logged under their own top-level "err_buffer/" group (NOT the "train/" group).
+        if self.error_recycler is not None:
+            self.log_metrics.update(
+                {k: v for k, v in self.error_recycler.stats().items()}
+            )
         # Inner adaptation magnitude: how far the inner loop moved phi_0 per video.
         if "inner_adapt_norm" in stats:
             self.log_metrics["lora/inner_adapt_norm"] = stats["inner_adapt_norm"].detach()
@@ -341,6 +380,47 @@ def e2e_ttt_parser():
                         "matching TI2V-5B inference (fused first-frame anchor + 1-frame chunk "
                         "overlap). Effective only on a DiT with fused first-frame conditioning "
                         "(TI2V-5B); a no-op otherwise. Set false to train without it.")
+    er = parser.add_argument_group("E2E-TTT error recycling (SVI-style anti-drift)")
+    er.add_argument("--e2e_use_error_recycling", type=lambda s: str(s).lower() not in ("0", "false", "no"),
+                    default=False,
+                    help="Enable SVI-style recycled-error buffers (arXiv:2510.09212): harvest the "
+                         "model's own prediction errors into timestep-bucketed buffers and inject "
+                         "them into the memorize inputs / predict anchor frame, with clean targets.")
+    er.add_argument("--e2e_num_grids", type=int, default=50,
+                    help="Number of timestep grids (buckets), matched to a simulated "
+                         "num_grids-step inference schedule (SVI: --num_grids).")
+    er.add_argument("--e2e_error_buffer_k", type=int, default=250,
+                    help="Max error samples per grid per buffer (SVI: --error_buffer_k, theirs 500). "
+                         "CPU RAM = 2 buffers x num_grids x k x chunk-latent size (~2 MB each for "
+                         "TI2V-5B 21f 704x1280).")
+    er.add_argument("--e2e_buffer_warmup_iter", type=int, default=20,
+                    help="Collection-only outer steps before injection starts (SVI's "
+                         "--buffer_warmup_iter, but WITHOUT the all_gather: buffers are strictly "
+                         "per-process; E2E-TTT harvests num_mem_steps x num_mc_samples errors per "
+                         "step, so local collection fills the grids quickly).")
+    er.add_argument("--e2e_noise_prob", type=float, default=0.9,
+                    help="Predict loss: probability of injecting a recycled noise-direction error "
+                         "into the noise, with a CLEAN target (SVI: --noise_prob).")
+    er.add_argument("--e2e_latent_prob", type=float, default=0.9,
+                    help="Memorize loss: probability of corrupting the memorized chunk "
+                         "CONSISTENTLY (input and target), replicating the test-time TTT update. "
+                         "Also gates the predict-loss latent injection (clean target) "
+                         "(SVI: --latent_prob).")
+    er.add_argument("--e2e_y_prob", type=float, default=0.9,
+                    help="Probability of injecting a recycled data-direction error into the "
+                         "pinned anchor frame of the predict loss (SVI: --y_prob).")
+    er.add_argument("--e2e_clean_prob", type=float, default=0.1,
+                    help="Probability of overriding a draw to fully clean inputs "
+                         "(SVI: --clean_prob).")
+    er.add_argument("--e2e_error_modulate_factor", type=float, default=0.0,
+                    help="Injected errors are scaled by uniform(1-f, 1+f) "
+                         "(SVI: --error_modulate_factor).")
+    er.add_argument("--e2e_anchor_sample_from_all_grids",
+                    type=lambda s: str(s).lower() not in ("0", "false", "no"), default=True,
+                    help="Sample the anchor error from ALL timestep grids rather than the "
+                         "current one (SVI: --y_error_sample_from_all_grids). The anchor drift "
+                         "is a terminal, data-space error not tied to the current denoising "
+                         "timestep, so pooling grids maximises the small anchor buffer's use.")
     return parser
 
 
@@ -485,6 +565,16 @@ if __name__ == "__main__":
         e2e_algorithm=args.e2e_algorithm,
         e2e_first_order=args.e2e_first_order,
         e2e_condition_on_last_frame=args.e2e_condition_on_last_frame,
+        e2e_use_error_recycling=args.e2e_use_error_recycling,
+        e2e_num_grids=args.e2e_num_grids,
+        e2e_error_buffer_k=args.e2e_error_buffer_k,
+        e2e_buffer_warmup_iter=args.e2e_buffer_warmup_iter,
+        e2e_noise_prob=args.e2e_noise_prob,
+        e2e_latent_prob=args.e2e_latent_prob,
+        e2e_y_prob=args.e2e_y_prob,
+        e2e_clean_prob=args.e2e_clean_prob,
+        e2e_error_modulate_factor=args.e2e_error_modulate_factor,
+        e2e_anchor_sample_from_all_grids=args.e2e_anchor_sample_from_all_grids,
         outer_lr=args.learning_rate,
     )
     model_logger = ModelLogger(
