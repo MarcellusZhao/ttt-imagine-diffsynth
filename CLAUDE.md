@@ -93,6 +93,10 @@ A DiffSynth-native port of the `e2e_ttt_video/` algorithm from the sibling `ttt-
 - **Sequential inference** — single-prompt scripts: [Wan2.1-T2V-1.3B-e2e-ttt-custom.py](examples/wanvideo/model_inference/Wan2.1-T2V-1.3B-e2e-ttt-custom.py), [custom-prompts/Wan2.2-TI2V-5B-e2e-ttt-custom.py](examples/wanvideo/model_inference/custom-prompts/Wan2.2-TI2V-5B-e2e-ttt-custom.py). VBench suite sampling: [Wan2.1-T2V-1.3B-e2e-ttt-vbench.py](examples/wanvideo/model_inference/Wan2.1-T2V-1.3B-e2e-ttt-vbench.py) (per-algorithm `.sh` wrappers alongside), [vbench/Wan2.2-TI2V-5B-e2e-ttt-vbench.py](examples/wanvideo/model_inference/vbench/Wan2.2-TI2V-5B-e2e-ttt-vbench.py); YAML configs under [model_inference/configs/](examples/wanvideo/model_inference/configs/). Pass `--lora <ckpt>` to load a meta-trained φ₀ (a missing path falls back to a zero-init identity adapter). The TI2V-5B scripts also support `condition_on_last_frame` / `drop_boundary_frame` (anchor each chunk on the previous chunk's last frame, matching training).
 - **Two correctness constraints** (both handled in code): (1) second-order grads (`maml` only) require double-backward attention — `enable_double_backward_attention()` disables fused flash/sage kernels and pins math SDPA; it is called only when `--e2e_algorithm maml`, since FOMAML and Reptile each do a single backward per inner step and run fine with fused kernels; (2) the differentiable override path must run **without** activation checkpointing (non-reentrant checkpoint recomputes after the param-override context exits), enforced in `compute_flow_matching_loss`.
 
+### E2E-TTT TODO
+
+- [ ] Persist and restore `ErrorRecycler` state (noise/y/anchor replay buffers, warmup `iteration_count`, and counters) when resumable anti-drift post-training is needed. Current uninterrupted 3k-example runs intentionally start with fresh recycler state.
+
 ## Where the deep docs live
 
 The upstream docs under [docs/en/](docs/en/) are the authoritative explanation of the framework:
