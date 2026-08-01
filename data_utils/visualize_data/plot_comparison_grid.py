@@ -2,24 +2,24 @@
 
 Each input video becomes one row; frames are sampled at fixed frame indices and
 laid out as columns, with a row label overlaid in the upper left of the first
-frame and a frame-index header on top. This reproduces the qualitative comparison grids common in video-generation
+frame and a timestamp header on top. This reproduces the qualitative comparison grids common in video-generation
 papers (one method per row, time progressing left-to-right).
+
+Column headers are labeled in seconds, so `--fps` is required: it converts the
+sampled frame indices into timestamps (`frame_index / fps`).
 
 Single comparison (explicit paths + labels, sample every 30 frames, 7 columns):
     python -m data_utils.plot_comparison_grid \\
         --videos pose.mp4 one_to_all.mp4 steadydancer.mp4 ours.mp4 \\
         --labels Pose One-to-All SteadyDancer Ours \\
-        --start 0 --step 30 --count 7 \\
+        --start 0 --step 30 --count 7 --fps 16 \\
         --output comparison.pdf
 
 Explicit frame indices instead of start/step/count:
     python -m data_utils.plot_comparison_grid \\
         --videos a.mp4 b.mp4 --labels A B \\
-        --indices 0 48 96 144 192 \\
+        --indices 0 48 96 144 192 --fps 16 \\
         --output comparison.pdf
-
-Annotate column headers with time as well as frame index (needs a uniform fps):
-    python -m data_utils.plot_comparison_grid ... --fps 16
 
 Notes:
 - Frames are read by sequential decode (exact), not by codec seeking
@@ -130,17 +130,16 @@ def build_rows(
     return rows
 
 
-def column_header(frame_index: int, fps: Optional[float]) -> str:
-    if fps is not None and fps > 0:
-        return f"{frame_index / fps:.1f}s\n(f{frame_index})"
-    return f"f{frame_index}"
+def column_header(frame_index: int, fps: float) -> str:
+    """Label a column by its timestamp in seconds rather than its frame index."""
+    return f"{frame_index / fps:.1f}s"
 
 
 def render_grid(
     rows: List[VideoRow],
     indices: List[int],
     output_path: str,
-    fps: Optional[float],
+    fps: float,
     cell_width_in: float,
     dpi: int,
 ) -> None:
@@ -240,8 +239,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fps",
         type=float,
-        default=None,
-        help="If set, column headers also show time (frame_index / fps).",
+        required=True,
+        help="Frame rate of the videos; converts frame indices to the "
+        "timestamps shown as column headers (frame_index / fps).",
     )
     parser.add_argument(
         "--cell-width-in",
@@ -260,6 +260,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if args.fps <= 0:
+        raise ValueError(f"--fps must be positive, got {args.fps}.")
 
     if args.labels is None:
         labels = [osp.splitext(osp.basename(path))[0] for path in args.videos]
