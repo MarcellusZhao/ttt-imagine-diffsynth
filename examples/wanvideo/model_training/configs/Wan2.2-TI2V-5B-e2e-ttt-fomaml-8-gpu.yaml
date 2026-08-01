@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E-TTT meta-training config for Wan2.2-TI2V-5B — multi-GPU (DDP) variant.
+#
+# Data-parallel training: one video per GPU per step; accelerate/DDP averages the
+# meta-gradient on phi_0 across ranks (effective global batch = num GPUs). The
+# multi-GPU switch lives in the LAUNCHER, not this file — run with e.g. 4 GPUs:
+#
+#   python -m accelerate.commands.launch --num_processes 4 --multi_gpu \
+#       examples/wanvideo/model_training/train_e2e_ttt.py \
+#       --config examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-multi-gpu.yaml
+#
+# (or pass this YAML as the first arg to lora/Wan2.2-TI2V-5B-e2e-ttt-fomaml.sh
+# after configuring `accelerate config` for multi-GPU.)
+#
+# Multi-GPU notes:
+#   * FOMAML is DDP-safe as-is: inner-loop grads target LoRA clones (DDP reducer
+#     hooks fire only on the single outer backward), and skipped-short-video steps
+#     return a graph-connected zero over ALL trainable params, so ranks never
+#     desync. Do NOT combine with --enable_model_cpu_offload (single-GPU only).
+#   * Reptile is the exception (surrogate loss may need --find_unused_parameters);
+#     this config uses FOMAML.
+#   * DDP syncs every step, so step time = the slowest rank. e2e_num_chunks is
+#     therefore set to a positive cap below (unlike the single-GPU config's fully
+#     adaptive 0) to bound per-rank work and keep ranks from idling on stragglers.
+#   * learning_rate is per-step on the AVERAGED grad — same scale as single-GPU;
+#     you just traverse the dataset num_gpus x faster per epoch. save_steps counts
+#     optimizer steps, and each step now consumes num_gpus videos.
+#
+# The 5B DiT is sharded across 3 safetensors files — passed as a NESTED list so they
+# load as a single DiT ModelConfig (same as the inference script's sorted(glob(...))).
+# 5B is heavier than 1.3B; enable use_gradient_checkpointing if you hit OOM (it is auto-
+# disabled only on the differentiable meta path, so it still helps the rest of the graph).
+# Per-GPU memory is the same as a single-GPU run (DDP adds only tiny LoRA grad buckets).
+# ─────────────────────────────────────────────────────────────────────────────
+
+dataset:
+  dataset_base_path: /work/nlp/hzhao/datasets/e2e-ttt-video/ultravideo_long/curated_videos
+  dataset_metadata_path: /home/hzhao/ttt-imagine-diffsynth/datasets/ultravideo_long/ultravideo_long_filtered_all_16k.csv
+  dataset_repeat: 1
+  height: 480 # [352, 720]
+  width: 832 # [512, 1280]
+  # 0 = load each clip's FULL length so the chunk count adapts to video duration.
+  # Set a positive value to cap frames per clip (acts as an upper bound).
+  num_frames: 0
+  frame_rate: 16
+
+model:
+  model_paths:
+    - - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/google/umt5-xxl
+
+train:
+  learning_rate: 1.0e-5
+  # Outer-loop (meta) LR schedule on the AdamW over phi_0: linear warmup for the first
+  # 30 optimizer steps, then cosine decay to lr_min_ratio * learning_rate by the end of
+  # training. The inner loop is untouched: e2e_inner_lr stays a fixed algorithm constant.
+  # Watch train/meta_lr in wandb to see the live schedule.
+  lr_scheduler: cosine_warmup
+  lr_warmup_steps: 30
+  lr_min_ratio: 0.1
+  num_epochs: 1
+  output_path: ./models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml_cosine_lr_adamw_gs2_latent_handoff_err_rec_acn_uvl_fs_rsfps16_16k_8gpu # cc6 is short for chunk count capped at 6, uvl is short for ultra video long, fs is short for filtered short, rsfps16 means resampled fps to 16, gs2 means the number of gradient steps is 2, 4gpu marks the DDP data-parallel run, err_rec means error recycling
+  remove_prefix_in_ckpt: pipe.dit.
+  use_gradient_checkpointing: true
+
+lora:
+  lora_base_model: dit
+  lora_target_modules: [q, k, v, o, ffn.0, ffn.2]
+  lora_rank: 128
+
+# Weights & Biases monitoring. Offline by default (safe on air-gapped compute
+# nodes) — runs land in <output_path>/wandb_log; `export WANDB_MODE=online` to
+# stream live, or `disabled` to turn off without editing this file. The run name
+# defaults to the output_path basename. Only the MAIN process logs, so per-video
+# diagnostics (train/num_chunks, train/memorize_loss, ...) reflect rank 0's
+# examples; the outer-loop signals (train/meta_grad_norm) are computed on the
+# already all-reduced grads and are global. All metrics are logged under the
+# wandb "train" group each step: train/meta_loss, train/memorize_loss,
+# train/num_pred_pairs, train/num_mem_steps, train/inner_lr, train/num_chunks,
+# train/skipped_short_video, and train/meta_lr (the live outer-loop LR).
+logger:
+  enable_wandb_log: true
+  wandb_project: E2E-TTT
+
+e2e_ttt:
+  # Positive CAP on chunks per clip (the single-GPU config uses 0 = fully adaptive).
+  # Under DDP every rank waits at the grad all-reduce for the slowest rank, so an
+  # unbounded per-clip chunk count makes throughput track the longest clip drawn
+  # each step (and, for extreme clips, risks the NCCL watchdog timeout). Clips
+  # shorter than the cap still yield their natural adaptive count; set 0 to restore
+  # fully adaptive chunking if your clip lengths are uniform.
+  e2e_num_chunks: 0
+  e2e_frames_per_chunk: 41 # [13, 25, 37, 49]
+  e2e_num_gradient_steps: 2
+  e2e_num_mc_samples: 1
+  e2e_inner_lr: 1.0e-4
+  e2e_max_inner_grad_norm: 1.0
+  e2e_inner_optimizer: adamw
+  e2e_truncate_steps: []
+  e2e_sigma_shift: 5.0
+  e2e_first_order: true         # FOMAML: drop the Hessian term
+  # Match TI2V-5B inference, which generates each follow-up chunk conditioned on the
+  # previous chunk's last frame (fused VAE first-frame anchor). When true, chunks are
+  # sliced with a 1-frame overlap so each predict chunk's first frame is the previous
+  # chunk's last frame, that frame is pinned clean (timestep 0) in the predict loss, and
+  # excluded from supervision -- so training and inference optimise the same objective.
+  # The memorize step stays unconditioned, matching the test-time TTT update.
+  e2e_condition_on_last_frame: true
+  # Error recycling
+  e2e_use_error_recycling: true
+  e2e_num_grids: 50
+  e2e_error_buffer_k: 96
+  e2e_buffer_warmup_iter: 20
+  e2e_noise_prob: 0.9
+  e2e_latent_prob: 0.9
+  e2e_y_prob: 0.9
+  e2e_clean_prob: 0.1
