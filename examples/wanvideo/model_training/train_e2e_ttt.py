@@ -26,13 +26,114 @@ from diffsynth.diffusion import *
 from diffsynth.diffusion.e2e_ttt import (
     InnerLoopConfig, ChunkingConfig, make_training_scheduler, run_meta_inner_loop,
     count_lora_params, enable_double_backward_attention, get_lora_params,
-    ErrorRecycler,
+    ErrorRecycler, anchor_overlap_pixel_frames, num_clean_latents,
 )
 
 # Reuse the vanilla module so all the model-loading / LoRA-injection plumbing is shared.
 from train import WanTrainingModule, wan_parser
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+class LengthGroupedSampler(torch.utils.data.Sampler):
+    """Order clips so the videos consumed by one optimizer step have similar lengths.
+
+    Why this helps: E2E-TTT step cost scales with a clip's CHUNK COUNT
+    (``n = (frames - fpc) // stride + 1``), which for this dataset ranges 3..23 with a
+    median of 6. Under DDP every rank blocks at the gradient all-reduce, so step
+    wall-clock is set by the LONGEST clip in the step, not the average -- a random window
+    of 8 clips nearly always contains an outlier. Measured on
+    ``ultravideo_long_filtered_all_16k.csv`` at 8 GPUs, ``sum_steps max_rank(n)`` is 26505
+    for random order vs 13748 for length-sorted (13738 = the perfectly-balanced floor),
+    i.e. ~half the DiT compute budget is currently ranks idling.
+
+    Why reordering the sampler is sufficient: accelerate shards a ``batch_size=1``
+    DataLoader round-robin -- ``BatchSamplerShard._iter_with_no_split`` hands sampler
+    position ``i`` to rank ``i % num_processes`` and yields once per full group -- so the
+    clips co-resident in one step are exactly the contiguous window
+    ``[g*G, (g+1)*G)`` of this sampler's output, where ``G = num_processes *
+    gradient_accumulation_steps`` (accumulation counts because ``accelerator.accumulate``
+    suppresses the all-reduce until the window closes). accelerate never reorders the
+    sampler, so controlling that order controls the grouping.
+
+    Order produced (the "sortish" scheme, as in HF's ``group_by_length``):
+      global shuffle -> cut into megabatches of ``G * megabatch_mult`` -> sort each
+      megabatch by length -> cut into G-sized groups -> shuffle the GROUPS.
+
+    Sorting inside a bounded megabatch rather than globally keeps substantial sampling
+    randomness, and shuffling the resulting groups means clip length does not correlate
+    with training *time* -- otherwise the LR warmup, the cosine decay and the
+    ErrorRecycler warmup would each see a biased slice of the length distribution.
+    Residual (accepted) bias: within a single step the 8 clips are length-correlated, so
+    the per-step gradient is less length-diverse than under pure shuffling.
+
+    This is a pure scheduling heuristic: ``lengths`` only needs to rank clips correctly.
+    The true frame count is still measured at load time by ``LoadVideo``, so a stale or
+    approximate length degrades balance and can never change what is trained.
+
+    Determinism across ranks is self-contained (seeded generator, no reliance on
+    ``synchronize_rng_states``): accelerate only broadcasts a sampler's RNG state when the
+    sampler exposes a ``.generator`` attribute, which this one deliberately does not.
+    """
+
+    def __init__(self, lengths, group_size, megabatch_mult=50, seed=0):
+        self.lengths = [float(x) for x in lengths]
+        self.group_size = max(1, int(group_size))
+        self.megabatch_mult = max(1, int(megabatch_mult))
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        # Called by accelerate's DataLoaderShard.set_epoch each epoch, so multi-epoch runs
+        # get a fresh permutation instead of replaying one fixed order.
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return len(self.lengths)
+
+    def __iter__(self):
+        n = len(self.lengths)
+        if n == 0:
+            return iter([])
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        perm = torch.randperm(n, generator=g).tolist()
+
+        G, mega = self.group_size, self.group_size * self.megabatch_mult
+        ordered = []
+        for i in range(0, n, mega):
+            block = perm[i:i + mega]
+            block.sort(key=lambda idx: self.lengths[idx], reverse=True)
+            ordered.extend(block)
+
+        groups = [ordered[i:i + G] for i in range(0, n, G)]
+        # A short trailing group would shift every group after it off the step boundary,
+        # so it is pinned last instead of being shuffled into the middle.
+        tail = groups.pop() if len(groups[-1]) != G else None
+        out = [idx for gi in torch.randperm(len(groups), generator=g).tolist() for idx in groups[gi]]
+        if tail is not None:
+            out.extend(tail)
+        return iter(out)
+
+    def imbalance_report(self, chunk_fn=None):
+        """Predicted straggler cost of this ordering vs a random one, as
+        ``sum_steps max(work) / mean(work)`` (1.0 = perfectly balanced). ``chunk_fn`` maps a
+        length to a work estimate; defaults to the length itself. Diagnostics only."""
+        w = [float(chunk_fn(x)) if chunk_fn else float(x) for x in self.lengths]
+        if not w:
+            return {}
+        G = self.group_size
+        ideal = sum(w) / G
+        order = list(self.__iter__())
+        grouped = sum(max(w[i] for i in order[k:k + G]) for k in range(0, len(order), G))
+        rnd = torch.randperm(len(w), generator=torch.Generator().manual_seed(0)).tolist()
+        random_cost = sum(max(w[i] for i in rnd[k:k + G]) for k in range(0, len(rnd), G))
+        return {
+            "group_size": G,
+            "grouped_over_ideal": grouped / ideal if ideal else 0.0,
+            "random_over_ideal": random_cost / ideal if ideal else 0.0,
+            "predicted_speedup": random_cost / grouped if grouped else 0.0,
+        }
 
 
 class WanE2ETTTTrainingModule(WanTrainingModule):
@@ -53,6 +154,8 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_algorithm="maml",
         e2e_first_order=False,
         e2e_condition_on_last_frame=True,
+        e2e_condition_on_sink_frame=True,
+        e2e_num_anchor_latent_frames=1,
         e2e_use_error_recycling=False,
         e2e_num_grids=50,
         e2e_error_buffer_k=32,
@@ -127,6 +230,27 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             print("[E2E-TTT] NOTE: this DiT has no fused first-frame conditioning "
                   "(fuse_vae_embedding_in_latents); training without last-frame conditioning "
                   "(contiguous, non-overlapping chunks). This is expected for Wan2.1-T2V.")
+        # First-frame "sink": additionally pin each video's very first chunk's first latent
+        # frame alongside the sliding last-frame anchor above. Requires the last-frame anchor
+        # to be effective too (there is no local anchor to pair the sink with otherwise).
+        self.condition_on_sink_frame = bool(e2e_condition_on_sink_frame) and self.condition_on_last_frame
+        if bool(e2e_condition_on_sink_frame) and not self.condition_on_last_frame:
+            print("[E2E-TTT] NOTE: --e2e_condition_on_sink_frame requires "
+                  "--e2e_condition_on_last_frame (and fused first-frame conditioning support); "
+                  "training without the first-frame sink.")
+        # Width of the LOCAL anchor block in latent frames (k). k=1 is the legacy
+        # single-frame anchor; k>1 pins a contiguous block of the preceding chunk so the
+        # predict step can actually see velocity. Inert without last-frame conditioning.
+        self.num_anchor_latent_frames = max(1, int(e2e_num_anchor_latent_frames))
+        if self.num_anchor_latent_frames > 1 and not self.condition_on_last_frame:
+            print("[E2E-TTT] NOTE: --e2e_num_anchor_latent_frames > 1 requires "
+                  "--e2e_condition_on_last_frame; training with a single anchor frame.")
+            self.num_anchor_latent_frames = 1
+        # Pixel frames of the preceding chunk the anchor block consumes == the chunk overlap.
+        self.anchor_overlap = (
+            anchor_overlap_pixel_frames(self.num_anchor_latent_frames, self.condition_on_sink_frame)
+            if self.condition_on_last_frame else 0
+        )
         # SVI-style recycled-error buffers for anti-drift (arXiv:2510.09212). Per-process
         # only (no all_gather); the warmup iterations are collection-only, then recycled
         # errors are injected into the memorize inputs and the predict anchor frame.
@@ -153,6 +277,11 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
               f"chunks={_chunks_desc} x {self.chunk_cfg.frames_per_chunk}f | "
               f"condition_on_last_frame={self.condition_on_last_frame} | "
+              f"condition_on_sink_frame={self.condition_on_sink_frame} | "
+              f"anchor_latents={self.num_anchor_latent_frames} "
+              f"(overlap={self.anchor_overlap}f, "
+              f"{num_clean_latents(self.num_anchor_latent_frames, self.condition_on_sink_frame)}"
+              f"/{(self.chunk_cfg.frames_per_chunk - 1) // 4 + 1} latents pinned) | "
               f"outer_lr={self.outer_lr} | "
               f"algorithm={self.inner_cfg.algorithm} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
@@ -169,11 +298,18 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         prompt = data["prompt"]
 
         fpc = self.chunk_cfg.frames_per_chunk
-        # Chunk stride. With first-frame conditioning, consecutive chunks OVERLAP by one
-        # frame (stride = fpc-1) so each chunk's first frame is the previous chunk's last
-        # frame -- the same autoregressive anchor the inference generator pins to
-        # (drop_boundary_frame). Without conditioning, chunks are contiguous (stride = fpc).
-        stride = (fpc - 1) if self.condition_on_last_frame else fpc
+        # Chunk stride. With first-frame conditioning, consecutive chunks OVERLAP by exactly
+        # the anchor window, so each chunk's leading latents ARE the previous chunk's tail --
+        # the same autoregressive anchor the inference generator pins to (drop_boundary_frame).
+        # k=1 -> 1 frame of overlap (the legacy single-frame anchor); k=3 with a sink -> 13,
+        # i.e. 12 anchored pixel frames plus one leading frame of VAE causal context. Without
+        # conditioning, chunks are contiguous (stride = fpc).
+        stride = (fpc - self.anchor_overlap) if self.condition_on_last_frame else fpc
+        if stride < 1:
+            raise ValueError(
+                f"e2e_frames_per_chunk={fpc} is too small for a k={self.num_anchor_latent_frames} "
+                f"anchor block (needs > {self.anchor_overlap} frames of overlap)."
+            )
         # Adaptive chunk count: as many chunks as fit in THIS clip. num_chunks (if set)
         # only caps it as a memory ceiling; leftover frames < fpc are dropped.
         n = (len(frames) - fpc) // stride + 1 if len(frames) >= fpc else 0
@@ -306,6 +442,8 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             write_back=False,
             algorithm=self.inner_cfg.algorithm,
             condition_on_first_frame=self.condition_on_last_frame,
+            condition_on_first_frame_sink=self.condition_on_sink_frame,
+            num_anchor_latent_frames=self.num_anchor_latent_frames,
             error_recycler=self.error_recycler,
         )
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
@@ -331,6 +469,15 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             # 1.0 when the predict loss conditions on the previous chunk's last frame
             # (TI2V-5B fused first-frame anchor), matching inference; 0.0 otherwise.
             "train/condition_on_last_frame": float(self.condition_on_last_frame),
+            # 1.0 when the predict loss additionally pins the video's very first frame as a
+            # fixed "sink" anchor alongside the sliding last-frame anchor; 0.0 otherwise.
+            "train/condition_on_sink_frame": float(self.condition_on_sink_frame),
+            # Width of the local anchor block (k) and the chunk overlap it forces. Logged
+            # because they jointly determine how much of each predict chunk is *given*
+            # context rather than supervised content -- the quantity to watch if the meta
+            # signal looks weak (raise e2e_frames_per_chunk rather than lowering k).
+            "train/num_anchor_latent_frames": float(self.num_anchor_latent_frames),
+            "train/anchor_overlap_frames": float(self.anchor_overlap),
         }
         # Recycled-error buffer fill/injection counters (per-process; rank 0 is logged).
         # Logged under their own top-level "err_buffer/" group (NOT the "train/" group).
@@ -351,8 +498,38 @@ def e2e_ttt_parser():
     parser = wan_parser()
     parser.add_argument("--config", type=str, default=None,
                         help="Path to a YAML config supplying argument defaults (CLI flags still override).")
-    parser.add_argument("--frame_rate", type=int, default=24,
-                        help="Target frame rate (fps) for sampling video frames in the data operator.")
+    parser.add_argument("--fix_frame_rate", action="store_true", default=False,
+                        help="Resample every clip's time axis to --frame_rate instead of reading its "
+                             "native frame sequence verbatim. OFF means --frame_rate is inert and the "
+                             "uniform-fps assumption rests entirely on offline preprocessing -- a "
+                             "silent hazard for E2E-TTT, whose multi-frame anchor block encodes "
+                             "velocity and therefore assumes a constant inter-frame interval. ON makes "
+                             "the assumption explicit and enforced. It is also cheaper: the frame count "
+                             "then comes from the container's `duration` instead of a full ffmpeg demux "
+                             "pass (0 count_frames() calls per clip instead of 1).")
+    parser.add_argument("--frame_rate", type=int, default=None,
+                        help="Target frame rate (fps). ONLY used when --fix_frame_rate is set; ignored "
+                             "otherwise. Must match the clips' on-disk fps: resampling DOWN drops frames "
+                             "(fine), but resampling UP duplicates them, which zeroes the motion between "
+                             "the duplicated pairs and destroys the velocity cue a k>1 anchor exists to "
+                             "carry. LoadVideo warns per clip when the source fps is below this.")
+    lg = parser.add_argument_group("Length-grouped batching")
+    lg.add_argument("--length_grouped_batching", action="store_true", default=False,
+                    help="Order clips so the videos in one optimizer step have similar lengths, "
+                         "instead of the default global shuffle. Under DDP each step costs as much "
+                         "as its LONGEST clip, so this removes most of the straggler wait. Requires "
+                         "a numeric --length_column in the dataset metadata (see "
+                         "datasets/ultravideo_long/add_length_column.py).")
+    lg.add_argument("--length_column", type=str, default="num_frames",
+                    help="Metadata column holding each clip's length. Any monotone proxy works "
+                         "(frame count, duration); it is a scheduling hint only and never affects "
+                         "what is trained -- the real length is measured at load time.")
+    lg.add_argument("--length_group_megabatch_mult", type=int, default=50,
+                    help="Sort window = group_size * this. Larger = tighter length grouping but "
+                         "less sampling randomness; 1 would sort the whole epoch globally.")
+    lg.add_argument("--length_group_seed", type=int, default=0,
+                    help="Seed for the length-grouped permutation. Must match across ranks (it "
+                         "does: every rank builds the same sampler from the same seed).")
     g = parser.add_argument_group("E2E-TTT")
     g.add_argument("--e2e_num_chunks", type=int, default=0,
                    help="Optional max temporal chunks per video (memory ceiling). "
@@ -380,6 +557,28 @@ def e2e_ttt_parser():
                         "matching TI2V-5B inference (fused first-frame anchor + 1-frame chunk "
                         "overlap). Effective only on a DiT with fused first-frame conditioning "
                         "(TI2V-5B); a no-op otherwise. Set false to train without it.")
+    g.add_argument("--e2e_condition_on_sink_frame", type=lambda s: str(s).lower() not in ("0", "false", "no"),
+                   default=True,
+                   help="Additionally condition each predict chunk on the video's very first "
+                        "chunk's first frame (a fixed 'sink' anchor), alongside the sliding "
+                        "--e2e_condition_on_last_frame anchor. Requires "
+                        "--e2e_condition_on_last_frame (and fused first-frame conditioning "
+                        "support); a no-op otherwise. Set false to train without it.")
+    g.add_argument("--e2e_num_anchor_latent_frames", type=int, default=1,
+                   help="Width k of the LOCAL anchor block, in LATENT frames, taken from the "
+                        "preceding chunk (default 1 = the legacy single-frame anchor). A single "
+                        "frame is motion-ambiguous, so with k=1 the only channel carrying motion "
+                        "DIRECTION into the next chunk is the LoRA scratchpad, whose "
+                        "unconditioned memorize objective is dominated by appearance -- a known "
+                        "cause of reversed motion at chunk boundaries. k>1 puts velocity "
+                        "directly in the conditioning. Sets the chunk overlap to "
+                        "anchor_overlap_pixel_frames(k, sink): k=3 with --e2e_condition_on_"
+                        "sink_frame anchors 12 pixel frames and overlaps 13 (one extra leading "
+                        "frame is VAE causal context, whose latent the sink overwrites). Costs "
+                        "supervised content: at frames_per_chunk=41 a k=3+sink block pins 4 of "
+                        "11 latents, so raise --e2e_frames_per_chunk (49 restores today's 9 "
+                        "supervised latents) rather than accepting the weaker meta signal. "
+                        "Requires --e2e_condition_on_last_frame.")
     er = parser.add_argument_group("E2E-TTT error recycling (SVI-style anti-drift)")
     er.add_argument("--e2e_use_error_recycling", type=lambda s: str(s).lower() not in ("0", "false", "no"),
                     default=False,
@@ -511,6 +710,22 @@ if __name__ == "__main__":
             print(f"[E2E-TTT] snapped frame size {args.height}x{args.width} -> "
                   f"{_aligned_h}x{_aligned_w} to align with the DiT patch grid")
     args.height, args.width = _aligned_h, _aligned_w
+    # --fix_frame_rate is only meaningful paired with an explicit target fps, and getting the
+    # pair wrong is far worse than leaving it off: at --frame_rate 24 against 16fps clips the
+    # resampler duplicates every third frame, which zeroes the motion across those pairs and
+    # poisons exactly the velocity signal the anchor block carries. Fail loudly rather than
+    # silently inheriting a default.
+    if args.fix_frame_rate and not args.frame_rate:
+        raise ValueError(
+            "--fix_frame_rate requires an explicit --frame_rate matching the clips' on-disk "
+            "fps. A mismatch silently drops frames (target < source) or DUPLICATES them "
+            "(target > source); the latter destroys the inter-frame motion that "
+            "--e2e_num_anchor_latent_frames > 1 exists to convey."
+        )
+    if accelerator.is_main_process:
+        print(f"[E2E-TTT] frame sampling | fix_frame_rate={args.fix_frame_rate}"
+              + (f" -> resampling every clip to {args.frame_rate}fps"
+                 if args.fix_frame_rate else " (native frame sequence; --frame_rate ignored)"))
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -528,9 +743,61 @@ if __name__ == "__main__":
             num_frames=(args.num_frames if args.num_frames and args.num_frames > 0 else None),
             time_division_factor=4,
             time_division_remainder=1,
-            frame_rate=args.frame_rate
+            # The 24 is inert filler for the --fix_frame_rate=False path, where LoadVideo
+            # never reads frame_rate; the pairing check above guarantees a real value exists
+            # whenever it IS read.
+            frame_rate=(args.frame_rate if args.frame_rate else 24),
+            fix_frame_rate=args.fix_frame_rate,
         ),
     )
+    # Length-grouped ordering (opt-in). Built here rather than inside the runner because the
+    # length metadata lives on the dataset rows. Index space matches UnifiedDataset.__len__,
+    # which is len(data) * dataset_repeat with __getitem__ wrapping modulo len(data).
+    sampler = None
+    if args.length_grouped_batching:
+        if dataset.load_from_cache:
+            raise ValueError("--length_grouped_batching needs metadata rows; it cannot be used "
+                             "with the cached-latent (no dataset_metadata_path) path.")
+        missing = [i for i, row in enumerate(dataset.data)
+                   if row.get(args.length_column) is None
+                   or not isinstance(row.get(args.length_column), (int, float))
+                   or row.get(args.length_column) != row.get(args.length_column)]  # NaN
+        if missing:
+            cols = sorted(dataset.data[0].keys()) if dataset.data else []
+            raise ValueError(
+                f"--length_grouped_batching: column '{args.length_column}' is missing or "
+                f"non-numeric for {len(missing)} of {len(dataset.data)} rows (first: index "
+                f"{missing[0]}). Available columns: {cols}. Generate it with "
+                f"datasets/ultravideo_long/add_length_column.py."
+            )
+        base_lengths = [float(row[args.length_column]) for row in dataset.data]
+        lengths = base_lengths * args.dataset_repeat
+        # The all-reduce is suppressed until the accumulation window closes, so the straggler
+        # unit is num_processes * gradient_accumulation_steps clips, not num_processes.
+        group_size = accelerator.num_processes * args.gradient_accumulation_steps
+        sampler = LengthGroupedSampler(
+            lengths, group_size,
+            megabatch_mult=args.length_group_megabatch_mult,
+            seed=args.length_group_seed,
+        )
+        if accelerator.is_main_process:
+            # Report balance against the actual cost driver (chunk count), not raw length.
+            _fpc = args.e2e_frames_per_chunk
+            _ov = anchor_overlap_pixel_frames(args.e2e_num_anchor_latent_frames,
+                                              args.e2e_condition_on_sink_frame)
+            _stride = (_fpc - _ov) if args.e2e_condition_on_last_frame else _fpc
+            def _chunks(length):
+                f = int(length)
+                f -= (f - 1) % 4                       # snap down to the 4n+1 grid
+                n = (f - _fpc) // _stride + 1 if f >= _fpc else 0
+                return max(n, 0) if args.e2e_num_chunks <= 0 else min(n, args.e2e_num_chunks)
+            rep = sampler.imbalance_report(chunk_fn=_chunks)
+            print(f"[E2E-TTT] length-grouped batching ON | column='{args.length_column}' "
+                  f"group_size={rep['group_size']} megabatch={group_size * args.length_group_megabatch_mult} | "
+                  f"straggler cost vs ideal: grouped {rep['grouped_over_ideal']:.2f}x, "
+                  f"random {rep['random_over_ideal']:.2f}x -> predicted speedup "
+                  f"{rep['predicted_speedup']:.2f}x")
+
     model = WanE2ETTTTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -565,6 +832,8 @@ if __name__ == "__main__":
         e2e_algorithm=args.e2e_algorithm,
         e2e_first_order=args.e2e_first_order,
         e2e_condition_on_last_frame=args.e2e_condition_on_last_frame,
+        e2e_condition_on_sink_frame=args.e2e_condition_on_sink_frame,
+        e2e_num_anchor_latent_frames=args.e2e_num_anchor_latent_frames,
         e2e_use_error_recycling=args.e2e_use_error_recycling,
         e2e_num_grids=args.e2e_num_grids,
         e2e_error_buffer_k=args.e2e_error_buffer_k,
@@ -588,4 +857,4 @@ if __name__ == "__main__":
         wandb_entity=args.wandb_entity,
         config=vars(args),
     )
-    launch_training_task(accelerator, dataset, model, model_logger, args=args)
+    launch_training_task(accelerator, dataset, model, model_logger, sampler=sampler, args=args)

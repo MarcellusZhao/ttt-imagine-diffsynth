@@ -192,6 +192,64 @@ class InferenceConfig:
     # When conditioning on the last frame, the first frame of each follow-up chunk
     # reproduces that anchor frame; drop it to avoid a duplicate-frame seam.
     drop_boundary_frame: bool = True
+    # First-frame "sink": additionally pin the video's very first generated frame
+    # alongside the sliding condition_on_last_frame anchor, for every follow-up chunk.
+    # On by default (matching training's --e2e_condition_on_sink_frame), but *gated* on
+    # condition_on_last_frame above: with no local anchor there is nothing to pair the sink
+    # with, so it stays inert. That gate is what lets this default to True harmlessly on
+    # models without fused first-frame conditioning. TI2V-5B only.
+    condition_on_first_frame_sink: bool = True
+    # Number of LOCAL anchor latent frames taken from the preceding chunk (k). 1 = the
+    # legacy single-frame anchor. k > 1 pins a contiguous *block* of the previous chunk's
+    # tail, which is what actually carries velocity: a single frame is motion-ambiguous,
+    # so the LoRA scratchpad is the only channel for "which way was it going". See
+    # ``anchor_overlap_pixel_frames`` for the pixel-frame cost. TI2V-5B only.
+    num_anchor_latent_frames: int = 1
+
+
+def num_pinned_pixel_frames(num_clean_latent_frames: int) -> int:
+    """Decoded frames covered by the leading ``num_clean_latent_frames`` pinned latents.
+
+    The Wan temporal VAE maps ``T`` latent frames to ``4 * (T - 1) + 1`` pixel frames:
+    latent frame 0 decodes to a single pixel frame, every later latent frame to 4. So a
+    lone local anchor (1 clean latent) pins 1 decoded frame, while a first-frame sink at
+    position 0 plus the local anchor at position 1 (2 clean latents) pins 1 + 4 = 5.
+    Those decoded frames are given context, not generated content, and are what
+    ``drop_boundary_frame`` trims at each chunk boundary.
+    """
+    n = max(1, int(num_clean_latent_frames))
+    return 4 * (n - 1) + 1
+
+
+def num_clean_latents(num_anchor_latent_frames: int, use_sink: bool) -> int:
+    """Total pinned leading latent frames: the local anchor block plus the optional sink."""
+    return max(1, int(num_anchor_latent_frames)) + (1 if use_sink else 0)
+
+
+def anchor_overlap_pixel_frames(num_anchor_latent_frames: int, use_sink: bool) -> int:
+    """Pixel frames of the preceding chunk that the anchor block consumes.
+
+    This is both the chunk *overlap* meta-training must slice with and the number of
+    decoded frames inference must hand forward, so training and test-time see byte-identical
+    anchor latents.
+
+    The Wan causal VAE gives latent 0 exactly 1 pixel frame and every later latent 4. With a
+    sink the anchor block is displaced to latent positions ``1..k``, so it covers ``4k``
+    pixel frames -- but producing latents that are *statistically correct at those positions*
+    requires one extra leading pixel frame as causal context (whose latent 0 the sink then
+    overwrites). Hence ``4k + 1 = num_pinned_pixel_frames(k + 1)``. Without a sink the block
+    sits at ``0..k-1`` and covers ``num_pinned_pixel_frames(k)``.
+
+    ``k == 1`` is the legacy single-frame anchor and always consumes exactly 1 pixel frame:
+    there, the anchor is a standalone single-frame encode placed at latent 0 (and the sink,
+    when present, is *prepended* rather than overwriting a contiguous encode). Keeping that
+    case byte-identical is what lets phi_0 checkpoints trained before this flag existed still
+    reproduce their baseline.
+    """
+    k = max(1, int(num_anchor_latent_frames))
+    if k == 1:
+        return 1
+    return num_pinned_pixel_frames(num_clean_latents(k, use_sink))
 
 
 # --------------------------------------------------------------------------- #
@@ -592,13 +650,13 @@ class ErrorRecycler:
         # We name the first one `noise_error_buffer` for clarity.
         self.noise_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
         self.y_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
-        # Dedicated SINGLE-FRAME anchor-error buffer. At inference the anchor is the
-        # previous chunk's *last generated frame*, so its drift is a terminal, data-space
-        # error of one frame -- a different distribution from the mid-trajectory,
-        # full-chunk data errors in `y_error_buffer`. We harvest it separately from the
-        # predict step's LAST frame (the frame that becomes the next anchor) and inject a
-        # single-frame slice into the pinned anchor. Kept apart from the full-chunk buffers
-        # so its shape ([B,C,1,H,W]) never collides with the full-chunk latent injections.
+        # Dedicated anchor-error buffer. At inference the anchor is the previous chunk's
+        # *last k generated frames*, so its drift is a terminal, data-space error of that
+        # k-frame block -- a different distribution from the mid-trajectory, full-chunk data
+        # errors in `y_error_buffer`. We harvest it separately from the predict step's LAST k
+        # frames (the frames that become the next anchor) and inject the block into the pinned
+        # anchor. Kept apart from the full-chunk buffers so its shape ([B,C,k,H,W]) never
+        # collides with the full-chunk latent injections.
         self.anchor_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
         # Anchor drift is terminal (data-space, timestep-independent), so it is not tied to
         # the current denoising timestep: sampling from any grid maximises buffer use.
@@ -692,7 +750,7 @@ class ErrorRecycler:
         return error_sample
 
     @torch.no_grad()
-    def harvest(self, scheduler: FlowMatchScheduler, noise_pred: torch.Tensor, training_target: torch.Tensor, noisy_latents: torch.Tensor, timestep, *, condition_on_first_frame: bool = False, source: Optional[str] = None) -> None:
+    def harvest(self, scheduler: FlowMatchScheduler, noise_pred: torch.Tensor, training_target: torch.Tensor, noisy_latents: torch.Tensor, timestep, *, condition_on_first_frame: bool = False, num_clean_frames: int = 1, num_anchor_frames: int = 1, source: Optional[str] = None) -> None:
         """Harvest the model's one-shot extrapolation errors (SVI train_svi.py:1151-1160).
 
         SVI computes both errors with `scheduler.step(..., to_final=True, self_corr=...)`;
@@ -701,13 +759,23 @@ class ErrorRecycler:
         (sigma_=1), self_corr=False at the data end (sigma_=0).
 
         ``condition_on_first_frame`` (predict objective with the fused first-frame anchor):
-        latent frame 0 is the pinned anchor -- fed at timestep 0 as clean context, never
-        denoised, and excluded from the loss -- so its slice of ``noisy_latents`` sits at
-        sigma~=0, not the sampled ``sigma``, making its extrapolated "error" numerically
-        meaningless (and possibly carrying the injected anchor y-error). We therefore zero
-        frame 0 in the full-chunk errors, and route the model's genuine terminal error on
-        the chunk's LAST frame -- the frame that becomes the next chunk's anchor at
-        inference -- into the dedicated single-frame ``anchor_error_buffer``.
+        latent frames ``0:num_clean_frames`` are the pinned anchor(s) -- fed at timestep 0
+        as clean context, never denoised, and excluded from the loss -- so their slice of
+        ``noisy_latents`` sits at sigma~=0, not the sampled ``sigma``, making their
+        extrapolated "error" numerically meaningless (and possibly carrying the injected
+        anchor y-error). We therefore zero those leading frames in the full-chunk errors,
+        and route the model's genuine terminal error on the chunk's LAST
+        ``num_anchor_frames`` frames -- exactly the frames that become the next chunk's
+        anchor at inference -- into the dedicated ``anchor_error_buffer`` as one contiguous
+        block. ``num_clean_frames`` counts all pinned leading frames (anchor block + optional
+        sink); ``num_anchor_frames`` is the anchor block width k alone, since the sink is a
+        fixed reference that never drifts and is never injected into.
+
+        Harvesting the last k frames as a *block* (rather than k single frames) is what makes
+        the injected anchor error temporally coherent -- see the injection site in
+        ``compute_flow_matching_loss``. The block width also happens to line up with the
+        pixel frames it represents: at k=3 the last 3 latents of a chunk cover its last 12
+        pixel frames, which is precisely the window inference hands forward.
         """
         if source == "memorize":
             self.num_harvested_memorize += 1  # #4 objective split
@@ -728,14 +796,18 @@ class ErrorRecycler:
         latent_corr_gt = noisy_latents + training_target * (0.0 - sigma)
         y_error = x_1_pred - latent_corr_gt
 
-        if condition_on_first_frame and y_error.shape[2] >= 2:
-            # The last frame's data-direction error is the terminal error of a frame
-            # generated from a (possibly drifted) context -- exactly the anchor drift.
-            self._add_error_to_buffer(self.anchor_error_buffer, y_error[:, :, -1:], timestep, "anchor")
-            # Frame 0 is the pinned anchor: its extrapolated error is garbage, so keep the
-            # full-chunk buffers uniform in shape by zeroing it rather than dropping it.
-            noise_error = noise_error.clone(); noise_error[:, :, 0:1] = 0
-            y_error = y_error.clone(); y_error[:, :, 0:1] = 0
+        k_anchor = max(1, int(num_anchor_frames))
+        if condition_on_first_frame and y_error.shape[2] >= num_clean_frames + k_anchor:
+            # The last k frames' data-direction error is the terminal error of frames
+            # generated from a (possibly drifted) context -- exactly the anchor drift. Taken
+            # as one slice so the block stays temporally coherent, and guarded so it can never
+            # overlap the pinned leading frames (whose "error" is meaningless, see above).
+            self._add_error_to_buffer(self.anchor_error_buffer, y_error[:, :, -k_anchor:], timestep, "anchor")
+            # The leading anchor frame(s) are pinned: their extrapolated error is garbage,
+            # so keep the full-chunk buffers uniform in shape by zeroing them rather than
+            # dropping them.
+            noise_error = noise_error.clone(); noise_error[:, :, 0:num_clean_frames] = 0
+            y_error = y_error.clone(); y_error[:, :, 0:num_clean_frames] = 0
 
         self._add_error_to_buffer(self.noise_error_buffer, noise_error, timestep, "noise")
         self._add_error_to_buffer(self.y_error_buffer, y_error, timestep, "y")
@@ -753,9 +825,11 @@ class ErrorRecycler:
 
     @torch.no_grad()
     def sample_anchor_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
-        """Single-frame terminal error for the anchor ('y') injection, drawn from the
-        dedicated ``anchor_error_buffer`` (harvested from the predict step's last frame).
-        ``like`` is the single pinned anchor frame ([B,C,1,H,W]).
+        """Terminal error block for the anchor ('y') injection, drawn from the dedicated
+        ``anchor_error_buffer`` (harvested from the predict step's last k frames).
+        ``like`` is the pinned anchor block ([B,C,k,H,W]); the buffer's shape check makes a
+        draw whose k differs simply miss, so changing k mid-run degrades to no injection
+        rather than injecting a mis-shaped error.
 
         Probability gating is handled together with the noise/latent gates in
         ``draw_injection_flags`` so ``clean_prob`` can force the entire prediction
@@ -920,6 +994,8 @@ def compute_flow_matching_loss(
     params_override: Optional[Dict[str, torch.Tensor]] = None,
     use_gradient_checkpointing: bool = False,
     condition_on_first_frame: bool = False,
+    sink_frame: Optional[torch.Tensor] = None,
+    num_anchor_latent_frames: int = 1,
     dit=None,
     error_recycler: Optional[ErrorRecycler] = None,
     inject_memorize_error: bool = False,
@@ -945,6 +1021,32 @@ def compute_flow_matching_loss(
     autoregressive anchor used by ``WanE2ETTTSequentialGenerator``. Only meaningful for a
     DiT with ``fuse_vae_embedding_in_latents`` (TI2V-5B); no-op for clips with <2 latent
     frames.
+
+    ``sink_frame`` (E2E-TTT first-frame "sink", optional, only meaningful together with
+    ``condition_on_first_frame``): a second clean anchor frame -- the video's very first
+    latent frame -- pinned *before* the usual local anchor, so the model conditions on
+    ``[sink_frame, x0[:, :, 0:1]]`` (2 clean leading frames) instead of just
+    ``x0[:, :, 0:1]``. This gives every predicted chunk a fixed, non-sliding reference to
+    how the video started, on top of the sliding previous-chunk anchor.
+
+    ``num_anchor_latent_frames`` (k) widens the LOCAL anchor from 1 latent frame to a
+    contiguous block of k. A single anchor frame is motion-ambiguous -- no velocity can be
+    read off one frame -- so with k=1 the only channel carrying "which way was it moving" is
+    the LoRA scratchpad, whose (unconditioned) memorize objective is dominated by appearance
+    rather than direction. k>1 puts the velocity directly in the conditioning.
+
+    Frame layout, all slices taken from the caller's overlap-chunked ``x0`` so the anchor
+    latents are genuine positional latents of a contiguous encode (never standalone
+    single-frame encodes dropped at position >0, whose VAE statistics would be wrong):
+
+      * no sink:   ``x0[:, :, 0:k]``      at latent positions ``0..k-1``   (num_clean = k)
+      * with sink: ``x0[:, :, 1:1+k]``    at latent positions ``1..k``     (num_clean = k+1)
+
+    With a sink the block is displaced by one position, so ``x0``'s own latent 0 is unused
+    (displaced from the input by the sink, excluded from the loss by ``num_clean``) and
+    serves only as the VAE causal context that makes latents ``1..k`` correct. The caller
+    must slice chunks with ``anchor_overlap_pixel_frames(k, use_sink)`` of overlap for these
+    slices to actually be the preceding chunk's tail.
     """
     if x0.dim() != 5:
         raise ValueError(f"Expected x0 [B,C,T,H,W], got {tuple(x0.shape)}")
@@ -954,10 +1056,24 @@ def compute_flow_matching_loss(
     min_ts = int(inner_cfg.min_timestep_boundary * num_ts)
     max_ts = max(min_ts + 1, int(inner_cfg.max_timestep_boundary * num_ts))
 
-    # First-frame conditioning is only the TI2V-5B fused path, and it needs at least one
-    # latent frame to predict after the (pinned) anchor frame; otherwise fall back to the
-    # plain unconditioned objective.
-    condition_on_first_frame = bool(condition_on_first_frame) and x0.shape[2] >= 2
+    # First-frame conditioning is only the TI2V-5B fused path. num_clean is the number of
+    # pinned leading frames: the k-frame local anchor block plus 1 when a sink is also given.
+    # It needs at least one latent frame to predict after the pinned anchor(s); otherwise fall
+    # back to the plain unconditioned objective.
+    sink_frame = sink_frame if condition_on_first_frame else None
+    k_anchor = max(1, int(num_anchor_latent_frames))
+    num_clean = num_clean_latents(k_anchor, sink_frame is not None)
+    # On the contiguous (k>1) path a sink displaces the anchor block to latent positions
+    # 1..k, so it is sliced from x0 at offset 1; x0's own latent 0 is then unused except as
+    # the VAE causal context that makes latents 1..k positionally correct.
+    #
+    # k == 1 must stay at offset 0. There the legacy layout applies: the chunk overlap is a
+    # single frame (anchor_overlap_pixel_frames returns 1), so x0's latent 0 -- not latent 1
+    # -- is the previous chunk's last frame, and the sink is *prepended* to it rather than
+    # overwriting a contiguous encode. Shifting this case would silently anchor every chunk
+    # on the wrong frame and invalidate phi_0 checkpoints trained before k existed.
+    anchor_start = 1 if (sink_frame is not None and k_anchor > 1) else 0
+    condition_on_first_frame = bool(condition_on_first_frame) and x0.shape[2] >= num_clean + 1
 
     # With a differentiable params_override, checkpointing is only safe because
     # _model_fn_with_override carries the override through the per-block recompute
@@ -1023,24 +1139,37 @@ def compute_flow_matching_loss(
         # even under generation-error injection (SVI's self-correcting supervision).
         target = scheduler.training_target(x0_used, noise_w_error, timestep)
         if condition_on_first_frame:
-            # Pin the first latent frame to the clean anchor (no noise), exactly as the
-            # inference pipeline re-clamps latents[:, :, 0:1] = first_frame_latents.
-            anchor = x0[:, :, 0:1]
+            # Pin the leading latent frame(s) to the clean anchor(s) (no noise), exactly as
+            # the inference pipeline re-clamps latents[:, :, 0:num_clean] = first_frame_latents.
+            # Only the LOCAL anchor (the last of the num_clean slots) gets SVI's anchor-error
+            # injection -- it is the frame that actually drifts at inference (a generated
+            # frame carried forward); the sink frame is a fixed reference captured once, so
+            # it is left clean.
+            local_anchor = x0[:, :, anchor_start:anchor_start + k_anchor]
             if error_recycler is not None and inject_anchor_error and injection_flags["y"]:
                 # SVI's y-error injection (train_svi.py:1118-1130): corrupt the
-                # conditioning frame with a recycled terminal single-frame error,
-                # simulating the drifted previous-chunk frame the anchor actually is at
-                # inference. Drawn from the dedicated anchor buffer (last-frame terminal
-                # errors), not the mid-trajectory full-chunk y buffer. Supervision stays clean.
-                a_err = error_recycler.sample_anchor_error(timestep, like=anchor)
+                # conditioning frame(s) with a recycled terminal error, simulating the
+                # drifted previous-chunk frames the anchor actually is at inference. Drawn
+                # from the dedicated anchor buffer (last-frame terminal errors), not the
+                # mid-trajectory full-chunk y buffer. Supervision stays clean.
+                #
+                # For k>1 this MUST be one contiguous k-frame block, not k independent
+                # single-frame draws: independent draws are temporally incoherent and would
+                # corrupt the very velocity cue the wider anchor exists to provide. The
+                # buffer stores k-frame blocks harvested from the predict chunk's last k
+                # latents (exactly the frames that become the next anchor), so a single
+                # shape-matched draw is already block-coherent.
+                a_err = error_recycler.sample_anchor_error(timestep, like=local_anchor)
                 if a_err is not None:
-                    anchor = anchor + a_err
-            latents = torch.cat([anchor, latents[:, :, 1:]], dim=2)
+                    local_anchor = local_anchor + a_err
+            anchor = torch.cat([sink_frame, local_anchor], dim=2) if sink_frame is not None else local_anchor
+            latents = torch.cat([anchor, latents[:, :, num_clean:]], dim=2)
         noise_pred = _model_fn_with_override(
             pipe, dit, params_override,
             latents=latents, timestep=timestep, context=context,
             use_gradient_checkpointing=gc,
             fuse_vae_embedding_in_latents=condition_on_first_frame,
+            num_fused_clean_frames=num_clean,
         )
         if error_recycler is not None and harvest_errors:
             # Recycle this draw's own prediction error into the buffers (SVI
@@ -1059,15 +1188,17 @@ def compute_flow_matching_loss(
                 # target is built from CLEAN x0, so latent/anchor injection (input-only)
                 # leaves no algebraic residue; only NOISE injection leaks into the target,
                 # so those draws are skipped. condition_on_first_frame routes the last
-                # frame's terminal error to the anchor buffer and drops the pinned frame 0.
+                # frame's terminal error to the anchor buffer and drops the pinned leading
+                # frame(s).
                 error_recycler.harvest(
                     scheduler, noise_pred, target, latents, timestep,
-                    condition_on_first_frame=condition_on_first_frame, source="predict",
+                    condition_on_first_frame=condition_on_first_frame, num_clean_frames=num_clean,
+                    num_anchor_frames=k_anchor, source="predict",
                 )
         if condition_on_first_frame:
-            # The anchor frame is given (timestep 0), not predicted -- supervise only the
-            # continuation frames, matching what the model actually generates at inference.
-            loss = F.mse_loss(noise_pred[:, :, 1:].float(), target[:, :, 1:].float())
+            # The anchor frame(s) are given (timestep 0), not predicted -- supervise only
+            # the continuation frames, matching what the model actually generates at inference.
+            loss = F.mse_loss(noise_pred[:, :, num_clean:].float(), target[:, :, num_clean:].float())
         else:
             loss = F.mse_loss(noise_pred.float(), target.float())
         total = total + loss * scheduler.training_weight(timestep)
@@ -1213,6 +1344,8 @@ def run_meta_inner_loop(
     write_back: bool = False,
     algorithm: Optional[str] = None,
     condition_on_first_frame: bool = False,
+    condition_on_first_frame_sink: bool = True,
+    num_anchor_latent_frames: int = 1,
     error_recycler: Optional[ErrorRecycler] = None,
 ):
     """Memorize->predict inner loop over chunk sequences (MAML / FOMAML / Reptile).
@@ -1237,7 +1370,13 @@ def run_meta_inner_loop(
     generator pins to the previous chunk's last frame. It assumes overlap-chunked input
     (consecutive chunks share their boundary frame); the memorize objective stays
     unconditioned, matching the test-time ``ttt_update_inplace``.
+
+    ``condition_on_first_frame_sink`` (on by default, requires ``condition_on_first_frame``)
+    additionally pins each video's very first chunk's first latent frame -- a fixed,
+    non-sliding "sink" -- alongside the sliding local anchor, for every predict step of that
+    video. Like ``condition_on_first_frame``, it never applies to the memorize objective.
     """
+    condition_on_first_frame_sink = bool(condition_on_first_frame_sink) and condition_on_first_frame
     algorithm = (algorithm or getattr(inner_cfg, "algorithm", "maml")).lower()
     if error_recycler is not None:
         # One outer step per call (batch of one video per rank); drives the warmup gate.
@@ -1288,6 +1427,12 @@ def run_meta_inner_loop(
 
         # Fresh LoRA init phi_0 for this video; clone keeps the graph to the real leaves.
         current_lora: Dict[str, torch.Tensor] = {n: base_params[n].clone() for n in lora_names}
+
+        # Fixed global anchor for this video: the very first chunk's first latent frame,
+        # pinned alongside the sliding local anchor in every predict step below. Always
+        # latent 0 of chunk 0 -- a position-0 latent used at position 0, so its VAE
+        # statistics are correct regardless of how wide the local anchor block is.
+        sink_frame = chunks[0][:, :, 0:1] if condition_on_first_frame_sink else None
 
         for k in range(len(chunks) - 1):
             # ---- memorize chunk k ----
@@ -1341,6 +1486,8 @@ def run_meta_inner_loop(
                 params_override={**current_lora},
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 condition_on_first_frame=condition_on_first_frame,
+                sink_frame=sink_frame,
+                num_anchor_latent_frames=num_anchor_latent_frames,
                 error_recycler=error_recycler,
                 inject_generation_error=True,
                 inject_anchor_error=condition_on_first_frame,
@@ -1528,9 +1675,22 @@ class WanE2ETTTSequentialGenerator:
         restore_lora_state(self.pipe.dit, self.phi0)
 
         all_frames = []
+        # Width of the local anchor block, in latent frames (k), and the number of decoded
+        # frames of the preceding chunk it consumes. k=1 keeps the legacy single-frame anchor.
+        k_anchor = max(1, int(getattr(icfg, "num_anchor_latent_frames", 1)))
+        sink_wanted = bool(icfg.condition_on_first_frame_sink) and bool(icfg.condition_on_last_frame)
+        anchor_window = anchor_overlap_pixel_frames(k_anchor, sink_wanted)
         # Running image anchor for autoregressive frame conditioning. Seeded with the
-        # optional I2V image; refreshed to the last generated frame after each chunk.
+        # optional I2V image; refreshed after each chunk to that chunk's trailing
+        # `anchor_window` frames, which the pipeline re-encodes as ONE contiguous clip so the
+        # anchor latents land at the positions they were trained at (see
+        # WanVideoUnit_ImageEmbedderFused). For k=1 this is the single last frame, exactly as
+        # before.
         cond_image = input_image
+        cond_frames = None
+        # Fixed global anchor ("first-frame sink"): the video's actual first raw frame,
+        # captured once after chunk 0 and reused unchanged for every later chunk.
+        sink_image = None
         for k in range(icfg.num_chunks):
             call_kwargs = dict(
                 prompt=prompt,
@@ -1549,6 +1709,20 @@ class WanE2ETTTSequentialGenerator:
             #   - k  > 0: the last frame of the previous chunk, when enabled.
             if cond_image is not None and (k == 0 or icfg.condition_on_last_frame):
                 call_kwargs["input_image"] = cond_image
+            # k>1: hand the whole trailing window forward. `anchor_frames` supersedes
+            # `input_image` inside the fused embedder, which encodes it as one clip. Only for
+            # follow-up chunks -- chunk 0 has no preceding chunk, so it stays a plain
+            # (optionally I2V-seeded) generation.
+            if k > 0 and icfg.condition_on_last_frame and k_anchor > 1 and cond_frames is not None:
+                call_kwargs["anchor_frames"] = cond_frames
+            # Sink-condition follow-up chunks on the video's very first frame, alongside
+            # the sliding local anchor above.
+            sink_active = (
+                k > 0 and icfg.condition_on_first_frame_sink
+                and icfg.condition_on_last_frame and sink_image is not None
+            )
+            if sink_active:
+                call_kwargs["sink_image"] = sink_image
             call_kwargs.update(extra_call_kwargs)
 
             # Latent handoff: ask the pipeline for the sampler's final latents alongside
@@ -1557,16 +1731,31 @@ class WanE2ETTTSequentialGenerator:
             # round-trip reconstruction error -- the memorized x0 is exactly what the
             # sampler produced.
             frames, chunk_latents = self.pipe(**call_kwargs, return_latents=True)
-            # The first frame of a follow-up chunk reproduces the anchor frame; drop it
-            # to avoid a duplicate-frame seam at the chunk boundary.
+            # The leading frames of a follow-up chunk reproduce the pinned anchor(s) rather
+            # than new content; drop them to avoid a duplicate-frame seam at the boundary.
             if k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
-                emitted = frames[1:]
+                emitted = frames[num_pinned_pixel_frames(num_clean_latents(k_anchor, sink_active)):]
             else:
                 emitted = frames
             all_frames.extend(emitted)
-            # Carry the last frame forward as the next chunk's anchor.
+            # Carry the anchor forward. `anchor_window` frames for the k>1 block path (a
+            # contiguous tail, re-encoded as one clip next iteration), the single last frame
+            # for the legacy k=1 path.
             if icfg.condition_on_last_frame and len(frames) > 0:
                 cond_image = frames[-1]
+                cond_frames = frames[-anchor_window:] if k_anchor > 1 else None
+                if cond_frames is not None and len(cond_frames) < anchor_window:
+                    # Would silently encode to fewer than k anchor latents and condition the
+                    # next chunk differently from training. Only reachable with a chunk
+                    # shorter than the anchor window, i.e. a misconfigured frames_per_chunk.
+                    raise ValueError(
+                        f"chunk {k} produced {len(frames)} frames but the k={k_anchor} anchor "
+                        f"block needs {anchor_window}; raise frames_per_chunk or lower "
+                        f"num_anchor_latent_frames."
+                    )
+            # Capture the video's first raw frame once, as the fixed sink anchor.
+            if k == 0 and sink_image is None and len(frames) > 0:
+                sink_image = frames[0]
             print(f"[E2E-TTT] generated chunk {k + 1}/{icfg.num_chunks} "
                   f"({len(emitted)} frames)")
 

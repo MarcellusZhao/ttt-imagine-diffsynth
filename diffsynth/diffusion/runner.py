@@ -50,6 +50,7 @@ def launch_training_task(
     enable_optimizer_cpu_offload: bool = False,
     cpu_offload_split_threshold: int = None,
     customized_optimizer: str = None,
+    sampler: torch.utils.data.Sampler = None,
     args = None,
     **kwargs,
 ):
@@ -70,7 +71,15 @@ def launch_training_task(
 
     optimizer_class = get_optimizer_class(customized_optimizer)
     optimizer = optimizer_class(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    # A caller-supplied sampler (e.g. length-grouped batching, see `LengthGroupedSampler`
+    # in examples/wanvideo/model_training/train_e2e_ttt.py) replaces the default random
+    # shuffle. `shuffle` and `sampler` are mutually exclusive in torch, so flip shuffle off
+    # when one is given; the sampler is responsible for its own per-epoch reshuffle and for
+    # being identical on every rank (accelerate shards it round-robin, it does not reorder).
+    dataloader = torch.utils.data.DataLoader(
+        dataset, shuffle=(sampler is None), sampler=sampler,
+        collate_fn=lambda x: x[0], num_workers=num_workers,
+    )
 
     if enable_model_cpu_offload:
         optimizer, dataloader = accelerator.prepare(optimizer, dataloader)

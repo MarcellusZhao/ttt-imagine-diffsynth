@@ -194,6 +194,15 @@ class WanVideoPipeline(BasePipeline):
         negative_prompt: str = "",
         # Image-to-video
         input_image: Image.Image = None,
+        # E2E-TTT: optional second fused-conditioning clean frame (the video's first
+        # frame, pinned alongside input_image as a persistent anti-drift anchor).
+        # Only meaningful together with input_image on a fuse_vae_embedding_in_latents DiT.
+        sink_image: Image.Image = None,
+        # E2E-TTT wide local anchor: the preceding chunk's trailing frames, encoded as ONE
+        # contiguous clip so the resulting anchor latents carry real velocity and sit at the
+        # latent positions they were meta-trained at. Supersedes input_image in the fused
+        # embedder when given. Only meaningful on a fuse_vae_embedding_in_latents DiT.
+        anchor_frames: list[Image.Image] = None,
         # First-last-frame-to-video
         end_image: Image.Image = None,
         # Video-to-video
@@ -286,6 +295,8 @@ class WanVideoPipeline(BasePipeline):
         }
         inputs_shared = {
             "input_image": input_image,
+            "sink_image": sink_image,
+            "anchor_frames": anchor_frames,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
@@ -336,7 +347,8 @@ class WanVideoPipeline(BasePipeline):
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
             if "first_frame_latents" in inputs_shared:
-                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+                n_clean = inputs_shared["first_frame_latents"].shape[2]
+                inputs_shared["latents"][:, :, 0:n_clean] = inputs_shared["first_frame_latents"]
         
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
@@ -520,22 +532,58 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
 class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
     """
     Encode input image to latents using VAE. This unit is for Wan-AI/Wan2.2-TI2V-5B.
+
+    ``sink_image`` (E2E-TTT only) is an optional second clean anchor frame -- the
+    video's very first frame, pinned alongside ``input_image``. It is concatenated
+    *before* ``input_image`` (sink, then local anchor) to match the frame order
+    ``compute_flow_matching_loss`` trains with, so the fused conditioning path
+    carries 2 clean leading frames instead of 1.
+
+    ``anchor_frames`` (E2E-TTT wide anchor, optional) supersedes ``input_image``: instead of
+    a lone frame it takes the preceding chunk's trailing window and encodes it as ONE
+    contiguous clip, yielding a k-frame anchor *block*. This matters because a single frame
+    is motion-ambiguous -- the block is what actually carries velocity into the next chunk.
+
+    The contiguous encode is not a convenience. The Wan causal VAE gives latent 0 exactly one
+    pixel frame and every later latent four, so stacking independent single-frame encodes at
+    positions >0 (as the ``sink_image`` path above does for its 2-frame case) produces latents
+    whose statistics do not match what the DiT expects at those positions. Encoding the window
+    in one pass gives genuine positional latents. With a sink the block is displaced to
+    positions ``1..k``, so the window carries one extra leading frame purely as VAE causal
+    context and the sink then *overwrites* latent 0 -- which is exactly the
+    ``x0[:, :, 1:1+k]`` slice meta-training pins (see ``anchor_overlap_pixel_frames``).
     """
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
-            output_params=("latents", "fuse_vae_embedding_in_latents", "first_frame_latents"),
+            input_params=("input_image", "sink_image", "anchor_frames", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
+            output_params=("latents", "fuse_vae_embedding_in_latents", "first_frame_latents", "num_fused_clean_frames"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_image, latents, height, width, tiled, tile_size, tile_stride):
-        if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents:
+    def process(self, pipe: WanVideoPipeline, input_image, sink_image, anchor_frames, latents, height, width, tiled, tile_size, tile_stride):
+        if (input_image is None and not anchor_frames) or not pipe.dit.fuse_vae_embedding_in_latents:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
-        z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        latents[:, :, 0: 1] = z
-        return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z}
+        if anchor_frames:
+            # Wide anchor: one contiguous encode of the whole window -> k (or k+1) latents.
+            clip = pipe.preprocess_video([f.resize((width, height)) for f in anchor_frames])
+            z = pipe.vae.encode([clip[0]], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            if sink_image is not None:
+                # The sink takes latent position 0, overwriting the window's leading latent
+                # (which existed only as causal context for latents 1..k). Encoded on its own
+                # as a single frame, so it is a position-0 latent used at position 0.
+                sink = pipe.preprocess_image(sink_image.resize((width, height))).transpose(0, 1)
+                z_sink = pipe.vae.encode([sink], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+                z = torch.concat([z_sink, z[:, :, 1:]], dim=2)
+        else:
+            image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
+            z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            if sink_image is not None:
+                sink = pipe.preprocess_image(sink_image.resize((width, height))).transpose(0, 1)
+                z_sink = pipe.vae.encode([sink], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+                z = torch.concat([z_sink, z], dim=2)
+        latents[:, :, 0: z.shape[2]] = z
+        return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z, "num_fused_clean_frames": z.shape[2]}
 
 
 
@@ -1315,6 +1363,7 @@ def model_fn_wan_video(
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
+    num_fused_clean_frames: int = 1,
     wantodance_refimage_feature = None,
     wantodance_fps: float = 30.0,
     music_feature = None,
@@ -1382,9 +1431,12 @@ def model_fn_wan_video(
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+        # num_fused_clean_frames leading latent frames are clean (timestep 0), e.g. E2E-TTT's
+        # optional first-frame "sink" pinned alongside the usual single anchor frame.
+        n_clean = num_fused_clean_frames
         timestep = torch.concat([
-            torch.zeros((1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
-            torch.ones((latents.shape[2] - 1, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
+            torch.zeros((n_clean, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
+            torch.ones((latents.shape[2] - n_clean, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
         ]).flatten()
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
         if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
