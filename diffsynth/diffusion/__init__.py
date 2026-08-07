@@ -10,6 +10,7 @@ from .e2e_ttt import (
     InferenceConfig,
     run_meta_inner_loop,
     ttt_update_inplace,
+    TestTimeInnerOptimizer,
     enable_double_backward_attention,
     make_training_scheduler,
     inject_lora_for_ttt,

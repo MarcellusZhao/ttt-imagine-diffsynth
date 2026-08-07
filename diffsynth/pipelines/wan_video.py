@@ -564,23 +564,43 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
         if (input_image is None and not anchor_frames) or not pipe.dit.fuse_vae_embedding_in_latents:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
+        # These encodes are deliberately UNTILED, ignoring the caller's `tiled`.
+        #
+        # E2E-TTT meta-training encodes every chunk -- and therefore every anchor latent it
+        # ever conditions on -- with `tiled=False` (see `_encode_chunks` in
+        # examples/wanvideo/model_training/train_e2e_ttt.py). Tiled encoding splits the frame
+        # spatially and alpha-blends overlapping tiles, so it does not reproduce the whole-frame
+        # encode: conditioning on tile-blended anchor latents puts phi_0 off the distribution it
+        # was meta-trained on, in exactly the tensor whose positional statistics this unit
+        # otherwise goes to some length to get right (see the class docstring).
+        #
+        # Whether it bites depends on resolution, which is why it was easy to miss: with
+        # WanVideoVAE38 (upsampling_factor=16) the default tile_size=(30, 52) latents covers
+        # 480x832 in a single tile, so tiling is a no-op there -- but at 704x1280 (44x80 latents)
+        # it genuinely tiles.
+        #
+        # Cost is bounded: this path encodes one frame, or the k-frame anchor window (<= 13
+        # frames), never a full chunk -- so untiled is affordable at any resolution the DiT can
+        # sample. `tiled`/`tile_size`/`tile_stride` stay in the signature because the pipeline
+        # threads them positionally, and they still govern the output VAE *decode*, which has no
+        # training-side counterpart to match.
         if anchor_frames:
             # Wide anchor: one contiguous encode of the whole window -> k (or k+1) latents.
             clip = pipe.preprocess_video([f.resize((width, height)) for f in anchor_frames])
-            z = pipe.vae.encode([clip[0]], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            z = pipe.vae.encode([clip[0]], device=pipe.device, tiled=False)
             if sink_image is not None:
                 # The sink takes latent position 0, overwriting the window's leading latent
                 # (which existed only as causal context for latents 1..k). Encoded on its own
                 # as a single frame, so it is a position-0 latent used at position 0.
                 sink = pipe.preprocess_image(sink_image.resize((width, height))).transpose(0, 1)
-                z_sink = pipe.vae.encode([sink], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+                z_sink = pipe.vae.encode([sink], device=pipe.device, tiled=False)
                 z = torch.concat([z_sink, z[:, :, 1:]], dim=2)
         else:
             image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
-            z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            z = pipe.vae.encode([image], device=pipe.device, tiled=False)
             if sink_image is not None:
                 sink = pipe.preprocess_image(sink_image.resize((width, height))).transpose(0, 1)
-                z_sink = pipe.vae.encode([sink], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+                z_sink = pipe.vae.encode([sink], device=pipe.device, tiled=False)
                 z = torch.concat([z_sink, z], dim=2)
         latents[:, :, 0: z.shape[2]] = z
         return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z, "num_fused_clean_frames": z.shape[2]}

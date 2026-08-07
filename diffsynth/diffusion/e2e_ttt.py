@@ -1526,6 +1526,76 @@ def run_meta_inner_loop(
 # --------------------------------------------------------------------------- #
 
 
+class TestTimeInnerOptimizer:
+    """Persistent test-time inner-loop optimizer for the LoRA scratchpad.
+
+    Meta-training runs the inner loop *functionally*: ``make_inner_optimizer(inner_cfg)``
+    is built once per outer step and its state (AdamW moments, Muon momentum) persists
+    across the whole chunk sequence of a video, while phi is a graph-connected clone of
+    phi_0. At test time phi_0 IS the live weight, so the update must be applied in place --
+    but it has to remain the SAME update rule with the SAME state lifetime, or phi_0 is
+    being evaluated under an adaptation procedure it was never meta-learned for.
+
+    Two things this class exists to get right, both of which the previous hand-rolled
+    in-place SGD got wrong:
+
+      * **Optimizer parity.** ``inner_cfg.optimizer`` is honoured here exactly as in
+        training. The old path hardcoded plain SGD and ignored the field entirely, so an
+        AdamW-meta-trained phi_0 was adapted by a different rule with a per-step
+        displacement orders of magnitude smaller: AdamW's preconditioned step moves each
+        coordinate by ~lr, whereas SGD under ``_per_tensor_clip(g, 1.0)`` moves a whole
+        tensor by at most ``lr`` in Frobenius norm, i.e. ~``lr/sqrt(numel)`` per
+        coordinate. Analytically that is a factor ~``sqrt(numel)`` (~600x for a 128x3072
+        LoRA factor); measured end-to-end on bf16 leaves at lr=1e-4/clip=1.0 over 2 steps
+        it is ~7200x, the extra factor being the bf16 quantization discussed below.
+
+      * **fp32 master weights.** The LoRA leaves are bf16 (8-bit mantissa), and at LoRA's
+        parameter scale (~1e-2) the quantum is ~7e-5, well above a clipped SGD step's
+        ~1.6e-7 per coordinate. An in-place bf16 ``sub_`` therefore discarded most of the
+        update, and being in-place it could never accumulate what it discarded. The
+        optimizer now runs on an fp32 master copy that is cast back into the live
+        parameters after each step, so small updates accumulate exactly even when a single
+        step is below the bf16 quantum. Note this is a *secondary* effect: measured on
+        rank-128 factors with lr=1e-4/clip=1.0 over 2 steps, the master alone changes
+        realized ||dphi||/||phi|| by only ~1.2x (2.0e-6 -> 2.4e-6, since the bf16 readback
+        still quantizes each step), whereas switching sgd -> adamw changes it by ~7200x
+        (2.0e-6 -> 1.5e-2). Meta-training keeps phi in bf16
+        (``upcast_dtype=pipe.torch_dtype``), so fp32 here is a deliberate one-directional
+        improvement; the live parameters the DiT reads stay bf16, so the forward is
+        unchanged.
+
+    State lifetime mirrors training: build one per video -- i.e. right after the scratchpad
+    is reset to phi_0 -- and reuse it across that video's chunks.
+    """
+
+    def __init__(self, dit: nn.Module, inner_cfg: InnerLoopConfig):
+        self.opt = make_inner_optimizer(inner_cfg)
+        lora_params = get_trainable_lora_params(dit)
+        if not lora_params:
+            raise ValueError("No trainable LoRA params found for test-time TTT.")
+        self.names = list(lora_params.keys())
+        self.params = [lora_params[n] for n in self.names]
+        # fp32 master copy of phi, seeded from the live (bf16) leaves.
+        self.master: Dict[str, torch.Tensor] = {
+            n: lora_params[n].detach().float().clone() for n in self.names
+        }
+
+    @torch.no_grad()
+    def apply(self, grads: Sequence[Optional[torch.Tensor]]) -> None:
+        """One optimizer step: advance the fp32 master from ``grads``, then write it back
+        into the live bf16 parameters. Grads are upcast so the clipping and the moment
+        updates are computed in fp32. ``max_inner_grad_norm`` is applied inside the
+        optimizer (``_per_tensor_clip``), the same call the meta-trained inner loop makes,
+        rather than re-implemented here."""
+        grad_map = {
+            n: (g.detach().float() if g is not None else None)
+            for n, g in zip(self.names, grads)
+        }
+        self.master = self.opt.step(self.master, grad_map)
+        for name, p in zip(self.names, self.params):
+            p.copy_(self.master[name].to(dtype=p.dtype))
+
+
 def ttt_update_inplace(
     pipe,
     scheduler: FlowMatchScheduler,
@@ -1534,14 +1604,19 @@ def ttt_update_inplace(
     inner_cfg: InnerLoopConfig,
     *,
     use_gradient_checkpointing: bool = False,
+    updater: Optional[TestTimeInnerOptimizer] = None,
 ) -> float:
-    """One or more first-order LoRA updates applied in place (no second-order graph).
-    Used between clips at test time. Returns the last loss value."""
-    lora_params = get_trainable_lora_params(pipe.dit)
-    if not lora_params:
-        raise ValueError("No trainable LoRA params found for test-time TTT.")
-    names = list(lora_params.keys())
-    params = [lora_params[n] for n in names]
+    """``inner_cfg.num_gradient_steps`` first-order LoRA updates applied in place (no
+    second-order graph). Used between chunks at test time. Returns the last loss value.
+
+    ``updater`` carries the optimizer state (AdamW moments / Muon momentum) and the fp32
+    master weights across calls, matching meta-training, where the inner optimizer is
+    built once per outer step and persists across the video's whole chunk sequence.
+    Passing ``None`` builds a throwaway one, which resets that state every call -- exact
+    only for stateless SGD; a caller generating multi-chunk video should own one per video
+    (see ``WanE2ETTTSequentialGenerator.generate``)."""
+    if updater is None:
+        updater = TestTimeInnerOptimizer(pipe.dit, inner_cfg)
     last = 0.0
     for _ in range(max(1, int(inner_cfg.num_gradient_steps))):
         with torch.enable_grad():
@@ -1550,16 +1625,8 @@ def ttt_update_inplace(
                 params_override=None,
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
-            grads = torch.autograd.grad(loss, params, allow_unused=True)
-        with torch.no_grad():
-            for p, g in zip(params, grads):
-                if g is None:
-                    continue
-                if inner_cfg.max_inner_grad_norm > 0:
-                    gn = g.norm()
-                    if gn > inner_cfg.max_inner_grad_norm:
-                        g = g * (inner_cfg.max_inner_grad_norm / (gn + 1e-8))
-                p.sub_(inner_cfg.inner_lr_init * g)
+            grads = torch.autograd.grad(loss, updater.params, allow_unused=True)
+        updater.apply(grads)
         last = float(loss.detach().item())
     return last
 
@@ -1632,7 +1699,13 @@ class WanE2ETTTSequentialGenerator:
     For each narrative prompt: reset the LoRA scratchpad to phi_0, then for chunk k:
     generate chunk k -> *memorize* it with in-place first-order LoRA TTT -> generate
     chunk k+1 with the adapted LoRA. Chunks are concatenated into one long video.
+
+    Subclasses customise via ``_chunk_prompts`` / ``_log_prefix``; the chunk loop itself
+    (anchor handoff, sink, k>1 block, boundary trimming, per-video optimizer state) is not
+    meant to be overridden -- a copy of it drifts out of sync with the anchoring rules.
     """
+
+    _log_prefix = "[E2E-TTT]"
 
     def __init__(
         self,
@@ -1649,6 +1722,13 @@ class WanE2ETTTSequentialGenerator:
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.scheduler = make_training_scheduler(infer_cfg.sigma_shift)
         self.phi0 = phi0 if phi0 is not None else snapshot_lora_state(pipe.dit)
+        # Echo the update rule phi_0 is about to be adapted with: it must match the
+        # meta-training run's --e2e_inner_optimizer / --e2e_inner_lr / --e2e_num_gradient_steps
+        # (note the effective step count is ttt_steps_per_chunk x num_gradient_steps).
+        print(f"{self._log_prefix} test-time inner loop: {inner_cfg.optimizer} "
+              f"lr={inner_cfg.inner_lr_init} clip={inner_cfg.max_inner_grad_norm} "
+              f"steps={infer_cfg.ttt_steps_per_chunk}x{inner_cfg.num_gradient_steps} "
+              f"mc={inner_cfg.num_mc_samples}")
 
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
         from ..pipelines.wan_video import WanVideoUnit_PromptEmbedder
@@ -1657,9 +1737,18 @@ class WanE2ETTTSequentialGenerator:
         emb = WanVideoUnit_PromptEmbedder().encode_prompt(self.pipe, prompt)
         return emb.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
+    def _chunk_prompts(self, prompt, num_chunks: int) -> List[str]:
+        """Per-chunk prompt schedule: entry k drives both the generation of chunk k and the
+        memorize step that follows it. The base behaviour broadcasts one prompt to every
+        chunk. Subclasses that vary the prompt across a narrative (see the memory-test
+        driver) override *this* rather than reimplementing ``generate`` -- the chunk loop
+        below carries the anchor/sink/k>1 bookkeeping, and a fork of it silently rots the
+        moment that bookkeeping changes."""
+        return [prompt] * num_chunks
+
     def generate(
         self,
-        prompt: str,
+        prompt,
         negative_prompt: str = "",
         *,
         input_image=None,
@@ -1668,11 +1757,20 @@ class WanE2ETTTSequentialGenerator:
     ):
         """Generate one long video (list of PIL frames) for a single narrative."""
         icfg = self.infer_cfg
+        prompts = self._chunk_prompts(prompt, icfg.num_chunks)
+        # Only worth logging per chunk when the schedule actually varies (memory-test).
+        varying_prompts = len(set(prompts)) > 1
         seed = icfg.seed if seed is None else seed
         extra_call_kwargs = extra_call_kwargs or {}
 
         # Reset the memory scratchpad to phi_0 for this narrative.
         restore_lora_state(self.pipe.dit, self.phi0)
+        # Fresh inner-loop optimizer for this narrative, seeded from the just-restored
+        # phi_0. Owned per video (not per chunk) so AdamW moments / Muon momentum carry
+        # across the chunk sequence exactly as they do in meta-training, where
+        # make_inner_optimizer is called once per outer step; and reset per video, matching
+        # the per-video phi_0 reset in run_meta_inner_loop.
+        updater = TestTimeInnerOptimizer(self.pipe.dit, self.inner_cfg)
 
         all_frames = []
         # Width of the local anchor block, in latent frames (k), and the number of decoded
@@ -1693,7 +1791,7 @@ class WanE2ETTTSequentialGenerator:
         sink_image = None
         for k in range(icfg.num_chunks):
             call_kwargs = dict(
-                prompt=prompt,
+                prompt=prompts[k],
                 negative_prompt=negative_prompt,
                 height=icfg.height,
                 width=icfg.width,
@@ -1756,8 +1854,9 @@ class WanE2ETTTSequentialGenerator:
             # Capture the video's first raw frame once, as the fixed sink anchor.
             if k == 0 and sink_image is None and len(frames) > 0:
                 sink_image = frames[0]
-            print(f"[E2E-TTT] generated chunk {k + 1}/{icfg.num_chunks} "
-                  f"({len(emitted)} frames)")
+            print(f"{self._log_prefix} generated chunk {k + 1}/{icfg.num_chunks} "
+                  f"({len(emitted)} frames)"
+                  + (f" | prompt: {prompts[k][:40]}..." if varying_prompts else ""))
 
             if k == icfg.num_chunks - 1:
                 continue
@@ -1765,14 +1864,18 @@ class WanE2ETTTSequentialGenerator:
             # Memorize the chunk we just generated -- straight from the sampler's final
             # latents (no VAE decode->re-encode round-trip).
             x0 = chunk_latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-            context = self._encode_prompt(prompt)
+            # Chunk k's own prompt -- the one it was generated under -- so the memorize
+            # objective conditions on the same text as the sample it is fitting. Identical
+            # to `prompt` unless a subclass supplies a varying schedule.
+            context = self._encode_prompt(prompts[k])
             self.pipe.load_models_to_device(["dit"])
             for step in range(max(1, int(icfg.ttt_steps_per_chunk))):
                 loss = ttt_update_inplace(
                     self.pipe, self.scheduler, x0, context, self.inner_cfg,
                     use_gradient_checkpointing=self.use_gradient_checkpointing,
+                    updater=updater,
                 )
-                print(f"[E2E-TTT]  memorize chunk {k + 1} step {step + 1}/"
+                print(f"{self._log_prefix}  memorize chunk {k + 1} step {step + 1}/"
                       f"{icfg.ttt_steps_per_chunk} loss={loss:.6f}")
 
         # Leave the scratchpad at phi_0 for the next narrative.
