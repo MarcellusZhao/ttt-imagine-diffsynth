@@ -1,8 +1,13 @@
 """
 Chunk-by-chunk long-video generation — Wan2.2-TI2V-5B (base model, no adaptation).
 
-For a single narrative prompt, the long video is produced by generating
+For each narrative prompt, the long video is produced by generating
 `--num_chunks` contiguous sub-clips one after another and concatenating them.
+
+`--prompt` takes **any number of prompts** (or `--prompt_file`, one per line), all served by
+a single pipeline load — do not call this script once per prompt from a shell loop, that
+re-loads the 5B DiT + umt5-xxl + VAE every time. Each prompt writes to its own
+`<output-dir>/<prompt[:30]>/` subdirectory; `--skip_existing` makes a re-submission resume.
 
 `--condition_on_last_chunk` (on by default) anchors each follow-up chunk on the
 previous chunk's last frame via TI2V-5B's native first-frame image conditioning,
@@ -42,10 +47,14 @@ def parse_args():
                         help="Device to load the pipeline on.")
 
     # Prompts
-    parser.add_argument("--prompt", type=str, required=True,
-                        help="Text prompt describing the video to generate.")
+    parser.add_argument("--prompt", type=str, nargs="+", default=None,
+                        help="One or more text prompts; each produces its own long video, "
+                             "all from a single pipeline load.")
+    parser.add_argument("--prompt_file", type=str, default=None,
+                        help="Path to a .txt with one prompt per line ('#' lines skipped). "
+                             "Overrides --prompt when set.")
     parser.add_argument("--negative_prompt", type=str, required=True,
-                        help="Negative prompt.")
+                        help="Negative prompt (applied to every prompt).")
 
     # Chunk-by-chunk controls
     parser.add_argument("--num_chunks", type=int, default=4,
@@ -71,38 +80,37 @@ def parse_args():
                         help="Output directory.")
     parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="Skip a prompt whose output video already exists (resumable).")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.prompt and not args.prompt_file:
+        parser.error("one of --prompt / --prompt_file is required")
+    return args
 
 
-def main():
-    args = parse_args()
+def resolve_prompts(args):
+    """The prompts to generate, in order: --prompt_file (one per line, blank and
+    '#'-commented lines skipped) when given, else the --prompt values."""
+    if args.prompt_file:
+        with open(args.prompt_file, "r") as f:
+            prompts = [line.strip() for line in f
+                       if line.strip() and not line.lstrip().startswith("#")]
+        if not prompts:
+            raise ValueError(f"--prompt_file '{args.prompt_file}' contains no prompts.")
+        return prompts
+    return list(args.prompt)
 
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=args.device,
-        model_configs=[
-            ModelConfig(path=os.path.join(args.model_dir, "models_t5_umt5-xxl-enc-bf16.pth")),
-            ModelConfig(path=sorted(glob.glob(os.path.join(args.model_dir, "diffusion_pytorch_model*.safetensors")))),
-            ModelConfig(path=os.path.join(args.model_dir, "Wan2.2_VAE.pth")),
-        ],
-        tokenizer_config=ModelConfig(path=os.path.join(args.model_dir, "google/umt5-xxl")),
-    )
 
-    output_dir = os.path.join(args.output_dir, args.prompt[:30])
-    os.makedirs(output_dir, exist_ok=True)
-    if args.condition_on_last_chunk:
-        output_path = os.path.join(output_dir, f"Wan2.2-TI2V-5B-chunk-by-chunk-with-conditioning.mp4")
-    else:
-        output_path = os.path.join(output_dir, f"Wan2.2-TI2V-5B-chunk-by-chunk-without-conditioning.mp4")
-
-    
+def generate_long_video(pipe, args, prompt):
+    """One long video for `prompt`: `--num_chunks` chunks concatenated, each optionally
+    anchored on the previous chunk's last frame. Returns (frames, seconds)."""
     all_frames = []
     cond_image = None
     total_time = 0
     for k in range(args.num_chunks):
         call_kwargs = dict(
-            prompt=args.prompt,
+            prompt=prompt,
             negative_prompt=args.negative_prompt,
             seed=args.seed + k,
             tiled=True,
@@ -128,10 +136,55 @@ def main():
         print(f"[chunk-by-chunk] generated chunk {k + 1}/{args.num_chunks} ({len(emitted)} frames)"
               + (" [anchored on prev chunk]" if args.condition_on_last_chunk and k > 0 else ""))
 
-    save_video(all_frames, output_path, fps=args.fps, quality=args.quality)
-    print(f"Total time taken to generate video: {total_time} seconds")
+    return all_frames, total_time
+
+
+def main():
+    args = parse_args()
+    prompts = resolve_prompts(args)
+
+    # Loaded once for the whole prompt list — the 5B DiT + umt5-xxl + VAE cost minutes to
+    # read off disk, so nothing below this line may depend on a single prompt.
+    load_start = time.time()
+    pipe = WanVideoPipeline.from_pretrained(
+        torch_dtype=torch.bfloat16,
+        device=args.device,
+        model_configs=[
+            ModelConfig(path=os.path.join(args.model_dir, "models_t5_umt5-xxl-enc-bf16.pth")),
+            ModelConfig(path=sorted(glob.glob(os.path.join(args.model_dir, "diffusion_pytorch_model*.safetensors")))),
+            ModelConfig(path=os.path.join(args.model_dir, "Wan2.2_VAE.pth")),
+        ],
+        tokenizer_config=ModelConfig(path=os.path.join(args.model_dir, "google/umt5-xxl")),
+    )
+    print(f"[chunk-by-chunk] loaded the pipeline in {time.time() - load_start:.1f}s "
+          f"for {len(prompts)} prompt(s)")
+
     conditioning = "with" if args.condition_on_last_chunk else "without"
-    print(f"Saved a {len(all_frames)}-frame chunk-by-chunk video {conditioning} conditioning to {output_path}.")
+    output_name = f"Wan2.2-TI2V-5B-chunk-by-chunk-{conditioning}-conditioning.mp4"
+
+    run_time = 0.0
+    num_generated = 0
+    for p_i, prompt in enumerate(prompts):
+        output_dir = os.path.join(args.output_dir, prompt[:30])
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_name)
+        if args.skip_existing and os.path.exists(output_path):
+            print(f"[{p_i + 1}/{len(prompts)}] exists, skipping: {output_path}")
+            continue
+        print(f"[{p_i + 1}/{len(prompts)}] Generating for prompt: {prompt[:60]}...")
+
+        # Every prompt uses the same base seed, as it did when this script was invoked once
+        # per prompt -- keeps previously sampled videos reproducible.
+        all_frames, total_time = generate_long_video(pipe, args, prompt)
+        run_time += total_time
+        num_generated += 1
+
+        save_video(all_frames, output_path, fps=args.fps, quality=args.quality)
+        print(f"Total time taken to generate video: {total_time} seconds")
+        print(f"Saved a {len(all_frames)}-frame chunk-by-chunk video {conditioning} conditioning to {output_path}.")
+
+    print(f"[chunk-by-chunk] generated {num_generated}/{len(prompts)} prompt(s) "
+          f"in {run_time:.1f}s total.")
 
 
 if __name__ == "__main__":

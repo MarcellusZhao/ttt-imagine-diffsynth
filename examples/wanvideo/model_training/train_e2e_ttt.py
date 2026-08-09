@@ -156,6 +156,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_condition_on_last_frame=True,
         e2e_condition_on_sink_frame=True,
         e2e_num_anchor_latent_frames=1,
+        e2e_attention_anchor=False,
         e2e_use_error_recycling=False,
         e2e_num_grids=50,
         e2e_error_buffer_k=32,

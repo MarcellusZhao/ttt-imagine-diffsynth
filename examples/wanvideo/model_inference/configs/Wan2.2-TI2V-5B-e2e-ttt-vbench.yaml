@@ -35,13 +35,18 @@ lora:
   # model_training/lora/Wan2.2-TI2V-5B-e2e-ttt-fomaml.sh (FOMAML). Update to the run you want.
   # lora: /home/hzhao/ttt-imagine-diffsynth/models/train/Wan2.2-TI2V-5B_e2e_ttt_fomaml-20260605-170105/epoch-0.safetensors
   algorithm: fomaml                # maml / fomaml / reptile (provenance of the checkpoint)
-  lora_rank: 32
+  lora_rank: 128
   target_modules: [q, k, v, o, ffn.0, ffn.2]
 
 inner_loop:
-  num_gradient_steps: 1
+  # Must match e2e_inner_optimizer in the training config that produced `lora` above
+  # (all Wan2.2-TI2V-5B training configs use adamw). The CLI default is `sgd`, and
+  # ttt_update_inplace now actually honours this field, so leaving it unset would adapt
+  # phi_0 with an update rule it was never meta-learned for.
+  optimizer: adamw
+  num_gradient_steps: 2
   num_mc_samples: 1
-  inner_lr_init: 1.0e-4
+  inner_lr_init: 1.0e-5
   max_inner_grad_norm: 1.0
 
 vbench:
@@ -51,15 +56,20 @@ vbench:
   base_seed: 0                   # clip i uses chunk seeds base_seed + i*num_chunks + k
 
 chunking:
-  num_chunks: 4                  # contiguous sub-clips generated sequentially per VBench clip
-  frames_per_chunk: 41           # 4n+1 for the Wan temporal VAE
+  num_chunks: 24                  # contiguous sub-clips generated sequentially per VBench clip
+  frames_per_chunk: 53           # 4n+1 for the Wan temporal VAE
   ttt_steps_per_chunk: 1         # test-time training steps applied per chunk
   condition_on_last_frame: true  # anchor each chunk on the previous chunk's last frame (TI2V-5B)
-  drop_boundary_frame: true      # drop the duplicated anchor frame at each chunk boundary
+  drop_boundary_frame: true      # drop the duplicated anchor frame(s) at each chunk boundary
+  # First-frame "sink": additionally pin the clip's very first frame (a fixed,
+  # non-sliding anchor) alongside the last-frame anchor above, in every follow-up
+  # chunk. Requires condition_on_last_frame. Set false (or pass
+  # --no_condition_on_sink_frame) for a phi_0 meta-trained without the sink.
+  condition_on_sink_frame: true
 
 generation:
-  height: 704
-  width: 1280
+  height: 480 # 480, 704
+  width: 832 # 832, 1280
   num_inference_steps: 50
   cfg_scale: 5.0
   sigma_shift: 5.0

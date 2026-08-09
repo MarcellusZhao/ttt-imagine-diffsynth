@@ -203,6 +203,12 @@ class WanVideoPipeline(BasePipeline):
         # latent positions they were meta-trained at. Supersedes input_image in the fused
         # embedder when given. Only meaningful on a fuse_vae_embedding_in_latents DiT.
         anchor_frames: list[Image.Image] = None,
+        # E2E-TTT attention anchor: clean latent frames [B, C, n, H', W'] from the preceding
+        # chunk (optionally led by a first-frame sink), prepended to the token sequence as
+        # extra conditioning positions with timestep 0. Unlike `anchor_frames` above this does
+        # not consume any of the chunk's own latent slots, needs no VAE encode, and works on
+        # any plain T2V DiT -- see `model_fn_wan_video`.
+        anchor_latents: torch.Tensor = None,
         # First-last-frame-to-video
         end_image: Image.Image = None,
         # Video-to-video
@@ -297,6 +303,7 @@ class WanVideoPipeline(BasePipeline):
             "input_image": input_image,
             "sink_image": sink_image,
             "anchor_frames": anchor_frames,
+            "anchor_latents": anchor_latents,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
@@ -1384,6 +1391,7 @@ def model_fn_wan_video(
     control_camera_latents_input = None,
     fuse_vae_embedding_in_latents: bool = False,
     num_fused_clean_frames: int = 1,
+    anchor_latents: Optional[torch.Tensor] = None,
     wantodance_refimage_feature = None,
     wantodance_fps: float = 30.0,
     music_feature = None,
@@ -1391,6 +1399,11 @@ def model_fn_wan_video(
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
+        if anchor_latents is not None:
+            # TemporalTiler slices only the tensors it is told about, so an anchor would be
+            # silently dropped (or applied whole to every window). E2E-TTT chunks the video
+            # itself, so the two are alternatives, not a combination.
+            raise ValueError("anchor_latents is not supported together with sliding-window inference.")
         model_kwargs = dict(
             dit=dit,
             motion_controller=motion_controller,
@@ -1449,8 +1462,61 @@ def model_fn_wan_video(
                                             get_sequence_parallel_world_size,
                                             get_sp_group)
 
+    # E2E-TTT attention anchor: `anchor_latents` [B, C, n, H', W'] is a block of CLEAN latent
+    # frames from the preceding chunk (plus an optional first-frame sink) that is prepended to
+    # the token sequence as extra positions -- it is conditioning, never output.
+    #
+    # This is a *different* mechanism from the fused first-frame path above (TI2V-5B's
+    # `anchor_frames`/`sink_image`, which overwrite the chunk's own leading latents). Here the
+    # anchor sits OUTSIDE the chunk, so every one of the chunk's latent frames still carries
+    # supervision and still becomes new video -- there is no pinned-frame tax and no boundary
+    # frame to trim. The cost is n extra sequence positions of attention.
+    #
+    # It needs no new parameters and no change to WanModel: clean frames are marked clean by
+    # giving them timestep 0 through the per-token modulation path that DiTBlock already
+    # implements (`has_seq`) and that TI2V-5B's `seperated_timestep` branch below also uses.
+    # At a uniform timestep that path is algebraically identical to the global one, so a DiT
+    # never trained with per-token timesteps (e.g. Wan2.1-T2V-1.3B) is unchanged when no
+    # anchor is passed -- which is what makes anchoring available to *any* Wan T2V DiT, not
+    # just the ones with `fuse_vae_embedding_in_latents`.
+    #
+    # RoPE places the anchor at temporal positions 0..n-1 and the chunk at n..n+f-1. Wan's
+    # rotary term depends only on position *differences*, so shifting the chunk changes
+    # nothing within it and simply puts the anchor immediately before it.
+    num_anchor_frames = 0 if anchor_latents is None else anchor_latents.shape[2]
+    num_anchor_tokens = 0
+    if anchor_latents is not None:
+        # The anchor goes through the chunk's own patch_embedding, so it must already have the
+        # DiT's full input channel count. On a `has_image_input` DiT the chunk is concatenated
+        # with `y` before patchify, so a bare 16-channel anchor would silently mis-embed --
+        # fail loudly instead. The anchor is meant for plain T2V DiTs (Wan2.1-T2V-1.3B/14B).
+        if anchor_latents.shape[1] != dit.in_dim:
+            raise ValueError(
+                f"anchor_latents has {anchor_latents.shape[1]} channels but this DiT's "
+                f"patch_embedding expects in_dim={dit.in_dim}"
+                + (" (this DiT concatenates an image-conditioning `y` before patchify, so the "
+                   "attention anchor is not supported on it)" if dit.has_image_input else "")
+            )
+        if anchor_latents.shape[3:] != latents.shape[3:]:
+            raise ValueError(
+                f"anchor_latents spatial shape {tuple(anchor_latents.shape[3:])} != "
+                f"latents {tuple(latents.shape[3:])}"
+            )
+
     # Timestep
-    if dit.seperated_timestep and fuse_vae_embedding_in_latents:
+    if anchor_latents is not None:
+        tokens_per_frame = latents.shape[3] * latents.shape[4] // 4
+        timestep = torch.concat([
+            torch.zeros((num_anchor_frames, tokens_per_frame), dtype=latents.dtype, device=latents.device),
+            torch.ones((latents.shape[2], tokens_per_frame), dtype=latents.dtype, device=latents.device) * timestep
+        ]).flatten()
+        t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0))
+        if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
+            t_chunks = torch.chunk(t, get_sequence_parallel_world_size(), dim=1)
+            t_chunks = [torch.nn.functional.pad(chunk, (0, 0, 0, t_chunks[0].shape[1]-chunk.shape[1]), value=0) for chunk in t_chunks]
+            t = t_chunks[get_sequence_parallel_rank()]
+        t_mod = dit.time_projection(t).unflatten(2, (6, dit.dim))
+    elif dit.seperated_timestep and fuse_vae_embedding_in_latents:
         # num_fused_clean_frames leading latent frames are clean (timestep 0), e.g. E2E-TTT's
         # optional first-frame "sink" pinned alongside the usual single anchor frame.
         n_clean = num_fused_clean_frames
@@ -1477,6 +1543,8 @@ def model_fn_wan_video(
     # Merged cfg
     if x.shape[0] != context.shape[0]:
         x = torch.concat([x] * context.shape[0], dim=0)
+        if anchor_latents is not None:
+            anchor_latents = torch.concat([anchor_latents] * context.shape[0], dim=0)
     if timestep.shape[0] != context.shape[0]:
         timestep = torch.concat([timestep] * context.shape[0], dim=0)
 
@@ -1500,7 +1568,18 @@ def model_fn_wan_video(
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
-    
+
+    # E2E-TTT attention anchor: patch-embed the clean anchor block with the SAME
+    # patch_embedding as the chunk (it is video latents, not a separate modality) and prepend
+    # it. `f` grows so the RoPE grid below covers anchor + chunk; the anchor tokens are
+    # stripped again after `dit.head`, mirroring the `reference_latents` prefix below.
+    if anchor_latents is not None:
+        x_anchor = dit.patch_embedding(anchor_latents.to(dtype=x.dtype, device=x.device))
+        x_anchor = rearrange(x_anchor, 'b c f h w -> b (f h w) c').contiguous()
+        num_anchor_tokens = x_anchor.shape[1]
+        x = torch.concat([x_anchor, x], dim=1)
+        f += num_anchor_frames
+
     # Reference image
     if reference_latents is not None:
         if len(reference_latents.shape) == 5:
@@ -1675,6 +1754,11 @@ def model_fn_wan_video(
     if reference_latents is not None:
         x = x[:, reference_latents.shape[1]:]
         f -= 1
+    # Remove the E2E-TTT anchor prefix: it is conditioning, so it has no target and must not
+    # reach unpatchify (the caller's latents have only the chunk's own frames).
+    if anchor_latents is not None:
+        x = x[:, num_anchor_tokens:]
+        f -= num_anchor_frames
     x = dit.unpatchify(x, (f, h, w))
     return x
 

@@ -1,34 +1,45 @@
 """
-VBench prompt-suite sampling with E2E-TTT sequential generation — Wan2.2-TI2V-5B.
+VBench prompt-suite sampling with CHUNK-BY-CHUNK generation and E2E-TTT-style anchoring
+— Wan2.2-TI2V-5B (base model, no LoRA, no test-time adaptation).
 
-This is the E2E-TTT counterpart to Wan2.2-TI2V-5B-vbench.py / -chunk-by-chunk-vbench.py:
-each VBench clip is generated chunk by chunk with test-time training — generate chunk k,
-*memorize* it via in-place first-order LoRA updates, then generate chunk k+1 with the
-adapted LoRA (the same procedure as Wan2.2-TI2V-5B-e2e-ttt-custom.py, driven over the
-whole VBench suite). The LoRA "memory scratchpad" is reset to the meta-init phi_0 before
-each clip, so clips never bleed adaptation into one another.
+This is the VBench driver for the ablation partner of the E2E-TTT runs: it is
+`Wan2.2-TI2V-5B-chunk-by-chunk-anchored-custom.py` swept over the whole VBench suite,
+i.e. `Wan2.2-TI2V-5B-e2e-ttt-vbench.py` with the LoRA memory scratchpad removed and
+*everything else* — the chunk loop, the inter-chunk conditioning, the boundary trim —
+held fixed. Read an E2E-TTT VBench number against this arm and the only difference is
+the scratchpad.
 
-On top of the LoRA memory, TI2V-5B anchors each chunk on the previous chunk's last frame
-via its fused VAE first-frame latent (`condition_on_last_frame`, on by default), plus a
-*second*, fixed anchor: the first frame of the whole clip (the "sink",
-`condition_on_sink_frame`, also on by default), giving every chunk a non-sliding reference
-to how the clip started to counteract long-horizon drift. The pinned anchor frames at each
-boundary are dropped (`drop_boundary_frame`, on by default) to avoid a seam. Pass
-`--no_condition_on_sink_frame` when sampling a phi_0 meta-trained without
-`--e2e_condition_on_sink_frame`.
+Two anchors are pinned into each follow-up chunk's leading latents via TI2V-5B's fused
+VAE conditioning:
+  * a **wide local anchor** — the previous chunk's trailing window, handed forward as ONE
+    contiguous clip (`anchor_frames`) so it encodes to a k-latent *block* that carries
+    real velocity rather than a motion-ambiguous single frame.
+    `--num_anchor_latent_frames` (k, default 3);
+  * a **global anchor** — the very first frame of the whole clip (the "sink"), captured
+    once after chunk 0 and reused unchanged, giving every chunk a non-sliding reference
+    to how the clip started to counteract long-horizon drift.
 
-Point --lora at a meta-trained phi_0 checkpoint (from
-model_training/lora/Wan2.2-TI2V-5B-e2e-ttt*.sh); if the path does not exist, generation
-falls back to a zero-init (identity) adapter and still adapts at test time. --algorithm
-records which meta-training variant produced that checkpoint (maml/fomaml/reptile); the
-test-time inner loop itself is first-order in every case.
+With the sink on, the anchor block is displaced to latent positions 1..k, so the window
+handed forward is 4k+1 pixel frames (k=3 -> 13) — one extra leading frame purely as VAE
+causal context, whose latent the sink overwrites. Those pinned frames are context, not
+new content, so they are trimmed at each boundary (`--no_drop_boundary_frame` keeps them).
+`--no_condition_on_sink_frame` drops the global anchor; `--no_condition_on_last_frame`
+drops both and makes every chunk an independent text-to-video generation.
+
+Unlike the plain `-chunk-by-chunk-vbench.py` (single last frame via `input_image`, k=1
+implicitly), the defaults here match the E2E-TTT scripts' anchoring, with the wider
+`--num_anchor_latent_frames 3` the anchored-custom script also defaults to. Keep the
+chunk geometry (`num_chunks`, `frames_per_chunk`, k, resolution) identical to the
+E2E-TTT arm you are comparing against — VBench metrics are length-sensitive.
 
 VBench sampling protocol (see VBench/prompts/README.md):
   * Read prompts from `prompts/all_dimension.txt` (default) or a single per-dimension
     file under `prompts/prompts_per_dimension/<dim>.txt`.
   * Sample N clips per prompt (default 5; 25 for `temporal_flickering`).
   * Use a *different, reproducible* seed for every clip — and, within a clip, a distinct
-    seed per chunk: clip `index` uses chunk seeds base_seed + index*num_chunks + k.
+    seed per chunk: clip `index` uses chunk seeds `base_seed + index*num_chunks + k`, so
+    no two chunks across the whole run collide (the same scheme as the other two drivers,
+    so arms share seeds clip for clip).
   * Name each clip `<save_path>/<prompt>-<index>.mp4`, index in 0..N-1 — the exact
     filename the VBench evaluator parses to recover the prompt.
 
@@ -48,8 +59,7 @@ import torch
 from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion.e2e_ttt import (
-    InnerLoopConfig, InferenceConfig, inject_lora_for_ttt, WanE2ETTTSequentialGenerator,
-    num_clean_latents, num_pinned_pixel_frames,
+    anchor_overlap_pixel_frames, num_clean_latents, num_pinned_pixel_frames,
 )
 
 
@@ -62,7 +72,9 @@ TEMPORAL_FLICKERING = "temporal_flickering"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="E2E-TTT VBench prompt-suite sampling with Wan2.2-TI2V-5B."
+        description="Chunk-by-chunk VBench prompt-suite sampling with Wan2.2-TI2V-5B "
+                    "(base model) using the E2E-TTT anchoring strategy "
+                    "(wide local anchor + first-frame sink)."
     )
 
     # Config (mirrors the training entrypoint: a YAML whose leaf keys match these
@@ -81,29 +93,6 @@ def parse_args():
                         help="Path to the umt5-xxl tokenizer (defaults to <model_dir>/google/umt5-xxl).")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to load the pipeline on.")
-
-    # LoRA "memory scratchpad"
-    parser.add_argument("--lora", type=str, required=True,
-                        help="Path to a meta-trained LoRA phi_0 checkpoint. A non-existent "
-                             "path falls back to a zero-init (identity) adapter.")
-    parser.add_argument("--algorithm", type=str, required=True, choices=["maml", "fomaml", "reptile"],
-                        help="Meta-training algorithm that produced --lora (recorded for provenance).")
-    parser.add_argument("--lora_rank", type=int, default=32, help="LoRA rank.")
-    parser.add_argument("--target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2",
-                        help="Comma-separated module name patterns to inject LoRA into.")
-
-    # Inner-loop (memorization) config
-    parser.add_argument("--optimizer", type=str, default="sgd",
-                        choices=["sgd", "adamw", "muon", "muonclip"],
-                        help="Differentiable inner-loop optimizer for the memorization update.")
-    parser.add_argument("--num_gradient_steps", type=int, default=1,
-                        help="Inner-loop gradient steps per memorization.")
-    parser.add_argument("--num_mc_samples", type=int, default=1,
-                        help="Monte-Carlo samples for the inner-loop loss.")
-    parser.add_argument("--inner_lr_init", type=float, default=1e-4,
-                        help="Initial inner-loop learning rate.")
-    parser.add_argument("--max_inner_grad_norm", type=float, default=1.0,
-                        help="Gradient-norm clip for the inner loop.")
 
     # VBench prompt selection
     parser.add_argument("--vbench_root", type=str, default=DEFAULT_VBENCH_ROOT,
@@ -130,57 +119,45 @@ def parse_args():
     parser.add_argument("--skip_existing", action="store_true",
                         help="Skip a clip if its output file already exists (resumable).")
 
-    # Inference / chunking config
+    # Chunk-by-chunk controls
     parser.add_argument("--num_chunks", type=int, default=4,
-                        help="Number of contiguous sub-clips to generate sequentially.")
+                        help="Number of contiguous sub-clips to generate and concatenate.")
     parser.add_argument("--frames_per_chunk", type=int, default=49,
                         help="Frames per chunk (4n+1, aligns with the Wan temporal VAE compression).")
-    parser.add_argument("--ttt_steps_per_chunk", type=int, default=1,
-                        help="Test-time training steps applied per chunk.")
-    parser.add_argument("--num_inference_steps", type=int, default=50,
-                        help="Number of denoising steps.")
-    parser.add_argument("--cfg_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
-    parser.add_argument("--sigma_shift", type=float, default=5.0, help="Flow-matching sigma shift.")
-    parser.add_argument("--no_gradient_checkpointing", dest="use_gradient_checkpointing",
-                        action="store_false",
-                        help="Retain all DiT activations during the test-time memorize "
-                             "backward instead of recomputing them (enabled by default). "
-                             "Checkpointing is numerically identical -- same update, one extra "
-                             "forward per inner step -- and is what keeps the inner loop inside "
-                             "80-96GB at 720p; without it a 704x1280 chunk at "
-                             "frames_per_chunk=53 OOMs on an H100.")
 
-    # TI2V-5B autoregressive anchoring
+    # Inter-chunk anchoring (mirrors Wan2.2-TI2V-5B-e2e-ttt-vbench.py)
     parser.add_argument("--no_condition_on_last_frame", dest="condition_on_last_frame",
                         action="store_false",
-                        help="Disable autoregressively anchoring each chunk on the previous chunk's "
-                             "last frame (enabled by default).")
-    parser.add_argument("--no_drop_boundary_frame", dest="drop_boundary_frame",
-                        action="store_false",
-                        help="Keep the duplicated anchor frame at each chunk boundary "
-                             "(dropped by default).")
+                        help="Disable anchoring each chunk on the previous chunk's trailing "
+                             "window (enabled by default). Turning this off also drops the "
+                             "sink, making every chunk an independent text-to-video generation.")
     parser.add_argument("--no_condition_on_sink_frame", dest="condition_on_sink_frame",
                         action="store_false",
-                        help="Disable additionally anchoring each follow-up chunk on the "
-                             "clip's very first generated frame (a fixed 'sink', enabled by "
-                             "default alongside the sliding last-frame anchor). The sink needs "
-                             "last-frame conditioning, and a phi_0 meta-trained with "
-                             "--e2e_condition_on_sink_frame.")
-    parser.add_argument("--num_anchor_latent_frames", type=int, default=1,
-                        help="Width k of the local anchor block in LATENT frames (default 1 = "
-                             "legacy single-frame anchor). Must MATCH the phi_0 checkpoint's "
-                             "--e2e_num_anchor_latent_frames: k determines how many leading "
-                             "latents are pinned and how many decoded frames each chunk hands "
-                             "forward, so a mismatch conditions the DiT differently from "
-                             "meta-training. k>1 hands the previous chunk's trailing window "
-                             "forward as ONE contiguous encode, giving the model real velocity "
-                             "instead of a motion-ambiguous single frame.")
+                        help="Disable the fixed global anchor -- the clip's very first "
+                             "generated frame -- pinned alongside the sliding local anchor "
+                             "(enabled by default). Requires last-frame conditioning.")
+    parser.add_argument("--no_drop_boundary_frame", dest="drop_boundary_frame",
+                        action="store_false",
+                        help="Keep the pinned anchor frames at each chunk boundary "
+                             "(dropped by default).")
+    parser.add_argument("--num_anchor_latent_frames", type=int, default=3,
+                        help="Width k of the local anchor block in LATENT frames (default 3). "
+                             "k>1 hands the previous chunk's trailing window forward as one "
+                             "contiguous encode, so the model sees actual velocity instead of "
+                             "a motion-ambiguous single frame. k=1 is the legacy single-frame "
+                             "anchor. Match the E2E-TTT arm being compared against.")
 
     # Generation settings
     parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT,
                         help="Negative prompt (applied to every chunk).")
     parser.add_argument("--height", type=int, default=704, help="Output video height.")
     parser.add_argument("--width", type=int, default=1280, help="Output video width.")
+    parser.add_argument("--num_inference_steps", type=int, default=50,
+                        help="Number of denoising steps.")
+    parser.add_argument("--cfg_scale", type=float, default=5.0,
+                        help="Classifier-free guidance scale.")
+    parser.add_argument("--sigma_shift", type=float, default=5.0,
+                        help="Flow-matching sigma shift.")
 
     # Output
     parser.add_argument("--save_path", type=str, required=True,
@@ -202,11 +179,11 @@ def parse_args():
 def apply_yaml_config(parser, config_path):
     """Load a YAML config and use its values as argument defaults so a single
     `--config foo.yaml` replaces the long CLI. The YAML may be grouped into
-    arbitrary sections (e.g. `model:`, `lora:`, `inner_loop:`, `vbench:`,
-    `chunking:`, `generation:`, `output:`) for readability; only leaf keys matter,
-    and they must match argparse dest names (e.g. `num_chunks`, `inner_lr_init`).
-    CLI flags still override the YAML. Returns the set of unrecognised leaf keys
-    (for a warning). Mirrors train_e2e_ttt.apply_yaml_config."""
+    arbitrary sections (e.g. `model:`, `vbench:`, `chunking:`, `generation:`,
+    `output:`) for readability; only leaf keys matter, and they must match argparse
+    dest names (e.g. `num_chunks`, `num_anchor_latent_frames`). CLI flags still
+    override the YAML. Returns the set of unrecognised leaf keys (for a warning).
+    Mirrors train_e2e_ttt.apply_yaml_config."""
     import yaml
 
     with open(config_path, "r") as f:
@@ -222,11 +199,9 @@ def apply_yaml_config(parser, config_path):
     _walk(cfg)
 
     # A model_paths list (possibly nested for sharded weights) is carried as the
-    # JSON form --model_paths expects; target_modules is the comma-joined form.
+    # JSON form --model_paths expects.
     if isinstance(flat.get("model_paths"), list):
         flat["model_paths"] = json.dumps(flat["model_paths"])
-    if isinstance(flat.get("target_modules"), list):
-        flat["target_modules"] = ",".join(map(str, flat["target_modules"]))
 
     valid_dests = {a.dest for a in parser._actions}
     defaults = {k: v for k, v in flat.items() if k in valid_dests}
@@ -273,17 +248,99 @@ def read_prompts(prompt_file):
         return [line.strip() for line in f if line.strip()]
 
 
+def generate_anchored_video(pipe, args, prompt, seed_base, k_anchor,
+                            condition_on_sink_frame, anchor_window):
+    """Generate one VBench clip as num_chunks concatenated sub-clips, anchored exactly
+    the way the E2E-TTT generator anchors — a contiguous k-latent block from the
+    previous chunk's tail plus the clip's first frame as a fixed sink. Chunk k uses
+    seed_base + k. Pinned (context, not content) frames are trimmed at each boundary."""
+    all_frames = []
+    # Running local anchor: the previous chunk's trailing `anchor_window` frames, re-encoded
+    # as ONE contiguous clip by WanVideoUnit_ImageEmbedderFused so the anchor latents land at
+    # the positions they belong to. k=1 keeps the legacy single-frame `input_image` path.
+    cond_image = None
+    cond_frames = None
+    # Fixed global anchor: the clip's first raw frame, captured once after chunk 0.
+    sink_image = None
+    for k in range(args.num_chunks):
+        call_kwargs = dict(
+            prompt=prompt,
+            negative_prompt=args.negative_prompt,
+            seed=seed_base + k,
+            tiled=True,
+            height=args.height,
+            width=args.width,
+            num_frames=args.frames_per_chunk,
+            num_inference_steps=args.num_inference_steps,
+            cfg_scale=args.cfg_scale,
+            sigma_shift=args.sigma_shift,
+        )
+        # Anchor this follow-up chunk on the previous chunk's tail.
+        if k > 0 and args.condition_on_last_frame:
+            if k_anchor > 1 and cond_frames is not None:
+                # `anchor_frames` supersedes `input_image` inside the fused embedder.
+                call_kwargs["anchor_frames"] = cond_frames
+            elif cond_image is not None:
+                call_kwargs["input_image"] = cond_image
+        sink_active = (
+            k > 0 and condition_on_sink_frame
+            and args.condition_on_last_frame and sink_image is not None
+        )
+        if sink_active:
+            call_kwargs["sink_image"] = sink_image
+
+        frames = pipe(**call_kwargs)
+
+        # The leading frames of a conditioned follow-up chunk reproduce the pinned anchor(s)
+        # rather than new content; drop them to avoid a duplicate-frame seam at the boundary.
+        if k > 0 and args.condition_on_last_frame and args.drop_boundary_frame:
+            emitted = frames[num_pinned_pixel_frames(num_clean_latents(k_anchor, sink_active)):]
+        else:
+            emitted = frames
+        all_frames.extend(emitted)
+
+        # Carry the local anchor forward: the trailing window for the k>1 block path, the
+        # single last frame for the legacy k=1 path.
+        if args.condition_on_last_frame and len(frames) > 0:
+            cond_image = frames[-1]
+            cond_frames = frames[-anchor_window:] if k_anchor > 1 else None
+            if cond_frames is not None and len(cond_frames) < anchor_window:
+                # Would silently encode to fewer than k anchor latents. Only reachable with a
+                # chunk shorter than the anchor window, i.e. a misconfigured frames_per_chunk.
+                raise ValueError(
+                    f"chunk {k} produced {len(frames)} frames but the k={k_anchor} anchor "
+                    f"block needs {anchor_window}; raise --frames_per_chunk or lower "
+                    f"--num_anchor_latent_frames."
+                )
+        # Capture the clip's first raw frame once, as the fixed sink anchor.
+        if k == 0 and sink_image is None and len(frames) > 0:
+            sink_image = frames[0]
+    return all_frames
+
+
 def main():
     args = parse_args()
 
-    # The sink is a *second* fused clean frame pinned next to the sliding last-frame
-    # anchor, so it only exists on the last-frame conditioning path. Both default to on,
-    # so turning off last-frame conditioning implies no sink either (same normalization as
-    # train_e2e_ttt.py).
+    # The sink is a *second* fused clean frame pinned next to the sliding local anchor, so it
+    # only exists on the last-frame conditioning path (same normalization as the E2E-TTT
+    # scripts and train_e2e_ttt.py).
     condition_on_sink_frame = args.condition_on_sink_frame and args.condition_on_last_frame
     if args.condition_on_sink_frame and not args.condition_on_last_frame:
         print("[VBench] NOTE: the first-frame sink requires last-frame conditioning; "
               "sampling without the sink.")
+
+    k_anchor = max(1, int(args.num_anchor_latent_frames))
+    # Pixel frames of each chunk handed forward as the next chunk's anchor block, and the
+    # number of leading decoded frames that are pinned context rather than new content.
+    anchor_window = anchor_overlap_pixel_frames(k_anchor, condition_on_sink_frame)
+    n_clean = num_clean_latents(k_anchor, condition_on_sink_frame)
+    pinned = num_pinned_pixel_frames(n_clean)
+    if args.condition_on_last_frame and args.frames_per_chunk <= max(anchor_window, pinned):
+        raise ValueError(
+            f"frames_per_chunk={args.frames_per_chunk} is too short for a k={k_anchor} anchor "
+            f"block (needs {anchor_window} frames handed forward, {pinned} pinned per chunk); "
+            f"raise --frames_per_chunk or lower --num_anchor_latent_frames."
+        )
 
     num_videos = args.num_videos_per_prompt
     if num_videos is None:
@@ -296,67 +353,27 @@ def main():
 
     os.makedirs(args.save_path, exist_ok=True)
     if args.condition_on_last_frame:
-        anchoring = "last-frame + first-frame sink" if condition_on_sink_frame else "last-frame"
+        anchoring = f"k={k_anchor} anchor block" \
+            + (" + first-frame sink" if condition_on_sink_frame else "")
     else:
-        anchoring = "none (LoRA memory only)"
-    print(f"[VBench/Wan2.2-TI2V-5B e2e-ttt:{args.algorithm}] {len(shard)} prompts "
+        anchoring = "none (independent chunks)"
+    print(f"[VBench/Wan2.2-TI2V-5B chunk-by-chunk anchored] {len(shard)} prompts "
           f"(indices {args.start_index}:{end_index} of {len(prompts)}) "
           f"x {num_videos} clips x {args.num_chunks} chunks -> {args.save_path}")
     print(f"[VBench] chunk anchoring: {anchoring}")
+    if args.condition_on_last_frame:
+        new_per_chunk = args.frames_per_chunk - (pinned if args.drop_boundary_frame else 0)
+        print(f"[VBench] anchor block k={k_anchor} latents | {n_clean} pinned latents | "
+              f"{pinned} pinned pixel frames/chunk -> {new_per_chunk} new frames per chunk "
+              f"x {args.num_chunks} chunks = "
+              f"{new_per_chunk * (args.num_chunks - 1) + args.frames_per_chunk} frames | "
+              f"{anchor_window} frames handed forward")
 
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device=args.device,
         model_configs=build_model_configs(args),
         tokenizer_config=build_tokenizer_config(args),
-    )
-
-    # Inject the LoRA "memory scratchpad" and (optionally) load the meta-trained phi_0.
-    phi0 = inject_lora_for_ttt(
-        pipe,
-        lora_rank=args.lora_rank,
-        target_modules=args.target_modules,
-        lora_checkpoint=args.lora if (args.lora and os.path.exists(args.lora)) else None,
-    )
-    if not (args.lora and os.path.exists(args.lora)):
-        print(f"[VBench] WARNING: --lora '{args.lora}' not found; using a zero-init identity adapter.")
-
-    inner_cfg = InnerLoopConfig(
-        num_gradient_steps=args.num_gradient_steps,
-        num_mc_samples=args.num_mc_samples,
-        inner_lr_init=args.inner_lr_init,
-        max_inner_grad_norm=args.max_inner_grad_norm,
-        optimizer=args.optimizer,
-    )
-    infer_cfg = InferenceConfig(
-        num_chunks=args.num_chunks,
-        frames_per_chunk=args.frames_per_chunk,   # 4n+1
-        ttt_steps_per_chunk=args.ttt_steps_per_chunk,
-        height=args.height,
-        width=args.width,
-        num_inference_steps=args.num_inference_steps,
-        cfg_scale=args.cfg_scale,
-        sigma_shift=args.sigma_shift,
-        seed=args.base_seed,
-        tiled=True,
-        condition_on_last_frame=args.condition_on_last_frame,
-        drop_boundary_frame=args.drop_boundary_frame,
-        condition_on_first_frame_sink=condition_on_sink_frame,
-        num_anchor_latent_frames=args.num_anchor_latent_frames,
-    )
-    _k = max(1, int(args.num_anchor_latent_frames))
-    _n_clean = num_clean_latents(_k, condition_on_sink_frame and args.condition_on_last_frame)
-    _pinned = num_pinned_pixel_frames(_n_clean)
-    print(f"[E2E-TTT] anchor block k={_k} latents | {_n_clean} pinned latents | "
-          f"{_pinned} pinned pixel frames/chunk -> {args.frames_per_chunk - _pinned} new "
-          f"frames per chunk x {args.num_chunks} chunks = "
-          f"{(args.frames_per_chunk - _pinned) * (args.num_chunks - 1) + args.frames_per_chunk} frames")
-
-    # Build the generator once; generate() resets the scratchpad to phi_0 before and
-    # after each narrative, so calling it per clip keeps every clip independent.
-    generator = WanE2ETTTSequentialGenerator(
-        pipe, inner_cfg, infer_cfg, phi0=phi0,
-        use_gradient_checkpointing=args.use_gradient_checkpointing,
     )
 
     for p_i, prompt in enumerate(shard):
@@ -366,10 +383,9 @@ def main():
                 continue
 
             seed_base = args.base_seed + index * args.num_chunks
-            frames = generator.generate(
-                prompt=prompt,
-                negative_prompt=args.negative_prompt,
-                seed=seed_base,
+            frames = generate_anchored_video(
+                pipe, args, prompt, seed_base, k_anchor,
+                condition_on_sink_frame, anchor_window,
             )
             save_video(frames, out_path, fps=args.fps, quality=args.quality)
             print(f"  [{args.start_index + p_i + 1}/{end_index}] clip {index} "

@@ -205,6 +205,52 @@ class InferenceConfig:
     # so the LoRA scratchpad is the only channel for "which way was it going". See
     # ``anchor_overlap_pixel_frames`` for the pixel-frame cost. TI2V-5B only.
     num_anchor_latent_frames: int = 1
+    # Use the ATTENTION anchor instead of the fused first-frame one: the preceding chunk's
+    # trailing ``num_anchor_latent_frames`` latents (plus the sink) are prepended to the token
+    # sequence as extra clean positions rather than overwriting the chunk's own leading
+    # latents. Works on any plain T2V DiT (Wan2.1-T2V-1.3B/14B), needs no VAE encode at test
+    # time, keeps every generated latent supervised, and produces no boundary frame to trim.
+    # Mutually exclusive with the fused path; see ``attention_anchor_latents``.
+    attention_anchor: bool = False
+
+
+def attention_anchor_latents(
+    prev_chunk: Optional[torch.Tensor],
+    num_anchor_latent_frames: int,
+    sink_latent: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Build the E2E-TTT attention-anchor block for the chunk that follows ``prev_chunk``.
+
+    ``[sink_latent] + prev_chunk[:, :, -k:]`` -- the video's first latent frame (fixed, if
+    given) followed by the preceding chunk's trailing k latents (sliding). Returns ``None``
+    when there is no predecessor, i.e. for chunk 0, which is generated unconditioned.
+
+    Two properties make this valid on both sides of train/test:
+
+    * The frames come from ONE contiguous encode (training: the VAE encode of that chunk;
+      inference: the sampler's own output latents for that chunk), so the k latents are
+      genuine positional latents rather than stacked single-frame encodes -- the same
+      requirement the fused path documents at ``WanVideoUnit_ImageEmbedderFused``.
+    * They are taken from the chunk *tail*, and the sink from position 0 of chunk 0, in both
+      training and inference. Unlike the fused path there is no overlap arithmetic to keep in
+      sync: chunks are contiguous and non-overlapping, and the anchor is simply the previous
+      chunk's last k latents.
+
+    A k-frame block (rather than 1) is what carries velocity across the boundary; with k=1 the
+    anchor is motion-ambiguous and the LoRA scratchpad is the only channel for direction.
+    """
+    if prev_chunk is None:
+        return None
+    k = max(1, int(num_anchor_latent_frames))
+    if prev_chunk.shape[2] < k:
+        raise ValueError(
+            f"attention anchor needs k={k} latent frames but the preceding chunk has only "
+            f"{prev_chunk.shape[2]}; raise frames_per_chunk or lower num_anchor_latent_frames."
+        )
+    block = prev_chunk[:, :, -k:]
+    if sink_latent is not None:
+        block = torch.cat([sink_latent, block], dim=2)
+    return block
 
 
 def num_pinned_pixel_frames(num_clean_latent_frames: int) -> int:
@@ -750,7 +796,7 @@ class ErrorRecycler:
         return error_sample
 
     @torch.no_grad()
-    def harvest(self, scheduler: FlowMatchScheduler, noise_pred: torch.Tensor, training_target: torch.Tensor, noisy_latents: torch.Tensor, timestep, *, condition_on_first_frame: bool = False, num_clean_frames: int = 1, num_anchor_frames: int = 1, source: Optional[str] = None) -> None:
+    def harvest(self, scheduler: FlowMatchScheduler, noise_pred: torch.Tensor, training_target: torch.Tensor, noisy_latents: torch.Tensor, timestep, *, condition_on_first_frame: bool = False, num_clean_frames: int = 1, num_anchor_frames: int = 1, attention_anchor: bool = False, source: Optional[str] = None) -> None:
         """Harvest the model's one-shot extrapolation errors (SVI train_svi.py:1151-1160).
 
         SVI computes both errors with `scheduler.step(..., to_final=True, self_corr=...)`;
@@ -797,7 +843,13 @@ class ErrorRecycler:
         y_error = x_1_pred - latent_corr_gt
 
         k_anchor = max(1, int(num_anchor_frames))
-        if condition_on_first_frame and y_error.shape[2] >= num_clean_frames + k_anchor:
+        if attention_anchor and y_error.shape[2] >= k_anchor:
+            # Attention anchor: nothing is pinned, so every frame's extrapolated error is
+            # genuine and the full-chunk buffers stay untouched. The chunk's last k latents
+            # still become the next chunk's anchor block verbatim, so their terminal error is
+            # exactly the drift that block will carry -- harvest it as one coherent slice.
+            self._add_error_to_buffer(self.anchor_error_buffer, y_error[:, :, -k_anchor:], timestep, "anchor")
+        elif condition_on_first_frame and y_error.shape[2] >= num_clean_frames + k_anchor:
             # The last k frames' data-direction error is the terminal error of frames
             # generated from a (possibly drifted) context -- exactly the anchor drift. Taken
             # as one slice so the block stays temporally coherent, and guarded so it can never
@@ -996,6 +1048,7 @@ def compute_flow_matching_loss(
     condition_on_first_frame: bool = False,
     sink_frame: Optional[torch.Tensor] = None,
     num_anchor_latent_frames: int = 1,
+    anchor_latents: Optional[torch.Tensor] = None,
     dit=None,
     error_recycler: Optional[ErrorRecycler] = None,
     inject_memorize_error: bool = False,
@@ -1047,7 +1100,20 @@ def compute_flow_matching_loss(
     serves only as the VAE causal context that makes latents ``1..k`` correct. The caller
     must slice chunks with ``anchor_overlap_pixel_frames(k, use_sink)`` of overlap for these
     slices to actually be the preceding chunk's tail.
+
+    ``anchor_latents`` is the ALTERNATIVE conditioning route (see ``attention_anchor_latents``)
+    and is mutually exclusive with everything above. Instead of overwriting ``x0``'s leading
+    latents, the anchor block is prepended to the DiT's token sequence as extra clean
+    positions, so ``x0`` is noised and supervised in full -- no frames are pinned, none are
+    dropped from the loss, and the chunk keeps every latent it has. That is what makes this
+    route usable on a plain T2V DiT with no fused first-frame conditioning at all, and why the
+    caller chunks contiguously rather than with an overlap.
     """
+    if anchor_latents is not None and (condition_on_first_frame or sink_frame is not None):
+        raise ValueError(
+            "anchor_latents (attention anchor) and condition_on_first_frame/sink_frame (fused "
+            "anchor) are two different conditioning mechanisms; pass exactly one."
+        )
     if x0.dim() != 5:
         raise ValueError(f"Expected x0 [B,C,T,H,W], got {tuple(x0.shape)}")
     dit = dit if dit is not None else pipe.dit
@@ -1164,12 +1230,25 @@ def compute_flow_matching_loss(
                     local_anchor = local_anchor + a_err
             anchor = torch.cat([sink_frame, local_anchor], dim=2) if sink_frame is not None else local_anchor
             latents = torch.cat([anchor, latents[:, :, num_clean:]], dim=2)
+        anchor_in = anchor_latents
+        if anchor_in is not None and error_recycler is not None and inject_anchor_error and injection_flags["y"]:
+            # Same SVI y-error injection as the fused path, applied to the prefix block: at
+            # inference this block is the previous chunk's *generated* (hence drifted) tail,
+            # so phi_0 must be meta-learned under that corruption. Only the trailing k frames
+            # are injected into -- when a sink leads the block it is a fixed reference frame
+            # captured once, which never drifts. Supervision stays clean either way, since the
+            # prefix carries no target.
+            k_inject = min(k_anchor, anchor_in.shape[2])
+            a_err = error_recycler.sample_anchor_error(timestep, like=anchor_in[:, :, -k_inject:])
+            if a_err is not None:
+                anchor_in = torch.cat([anchor_in[:, :, :-k_inject], anchor_in[:, :, -k_inject:] + a_err], dim=2)
         noise_pred = _model_fn_with_override(
             pipe, dit, params_override,
             latents=latents, timestep=timestep, context=context,
             use_gradient_checkpointing=gc,
             fuse_vae_embedding_in_latents=condition_on_first_frame,
             num_fused_clean_frames=num_clean,
+            anchor_latents=anchor_in,
         )
         if error_recycler is not None and harvest_errors:
             # Recycle this draw's own prediction error into the buffers (SVI
@@ -1193,7 +1272,8 @@ def compute_flow_matching_loss(
                 error_recycler.harvest(
                     scheduler, noise_pred, target, latents, timestep,
                     condition_on_first_frame=condition_on_first_frame, num_clean_frames=num_clean,
-                    num_anchor_frames=k_anchor, source="predict",
+                    num_anchor_frames=k_anchor, attention_anchor=anchor_latents is not None,
+                    source="predict",
                 )
         if condition_on_first_frame:
             # The anchor frame(s) are given (timestep 0), not predicted -- supervise only
@@ -1346,6 +1426,7 @@ def run_meta_inner_loop(
     condition_on_first_frame: bool = False,
     condition_on_first_frame_sink: bool = True,
     num_anchor_latent_frames: int = 1,
+    attention_anchor: bool = False,
     error_recycler: Optional[ErrorRecycler] = None,
 ):
     """Memorize->predict inner loop over chunk sequences (MAML / FOMAML / Reptile).
@@ -1375,8 +1456,22 @@ def run_meta_inner_loop(
     additionally pins each video's very first chunk's first latent frame -- a fixed,
     non-sliding "sink" -- alongside the sliding local anchor, for every predict step of that
     video. Like ``condition_on_first_frame``, it never applies to the memorize objective.
+
+    ``attention_anchor`` selects the other conditioning route instead (Wan2.1-T2V and any DiT
+    without fused first-frame conditioning): the predict loss for chunk k+1 is conditioned on
+    a prefix of clean tokens built from chunk k's trailing latents (plus the sink), so chunk
+    k+1 itself stays fully noised and fully supervised. It expects CONTIGUOUS, NON-OVERLAPPING
+    chunks -- the anchor is read from the preceding chunk directly, not from an overlap -- and
+    is mutually exclusive with ``condition_on_first_frame``.
     """
-    condition_on_first_frame_sink = bool(condition_on_first_frame_sink) and condition_on_first_frame
+    if attention_anchor and condition_on_first_frame:
+        raise ValueError(
+            "attention_anchor and condition_on_first_frame are alternative conditioning "
+            "mechanisms (prefix tokens vs fused pinned latents); enable exactly one."
+        )
+    condition_on_first_frame_sink = bool(condition_on_first_frame_sink) and (
+        condition_on_first_frame or attention_anchor
+    )
     algorithm = (algorithm or getattr(inner_cfg, "algorithm", "maml")).lower()
     if error_recycler is not None:
         # One outer step per call (batch of one video per rank); drives the warmup gate.
@@ -1481,16 +1576,24 @@ def run_meta_inner_loop(
             # self-correct mid-trajectory sampling errors. The pinned anchor frame
             # -- a *generated* frame at inference -- additionally gets SVI's y-error
             # injection, so phi_0 is meta-learned under realistic anchor corruption.
+            # Attention-anchor route: the anchor is a prefix built from chunk k's trailing
+            # latents (the frames inference will actually hand forward) plus the fixed sink,
+            # and chunk k+1 is left untouched -- fully noised, fully supervised.
+            anchor_prefix = (
+                attention_anchor_latents(chunks[k], num_anchor_latent_frames, sink_frame)
+                if attention_anchor else None
+            )
             loss_pred = compute_flow_matching_loss(
                 pipe, scheduler, chunks[k + 1], ctx, inner_cfg,
                 params_override={**current_lora},
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 condition_on_first_frame=condition_on_first_frame,
-                sink_frame=sink_frame,
+                sink_frame=None if attention_anchor else sink_frame,
                 num_anchor_latent_frames=num_anchor_latent_frames,
+                anchor_latents=anchor_prefix,
                 error_recycler=error_recycler,
                 inject_generation_error=True,
-                inject_anchor_error=condition_on_first_frame,
+                inject_anchor_error=condition_on_first_frame or attention_anchor,
                 # Harvest the predict step's genuine corrupted-input (compounding) errors:
                 # full-chunk noise/data errors into the shared buffers and the last frame's
                 # terminal error into the anchor buffer. Noise-injected draws are skipped
@@ -1716,6 +1819,15 @@ class WanE2ETTTSequentialGenerator:
         phi0: Optional[Dict[str, torch.Tensor]] = None,
         use_gradient_checkpointing: bool = False,
     ):
+        # Off by default here; the Wan2.2-TI2V-5B drivers pass True (their
+        # --no_gradient_checkpointing turns it off). At test time the memorize step runs
+        # with params_override=None, so it takes the stock pipe.model_fn checkpointing --
+        # numerically identical to retaining activations, at one extra forward per inner
+        # step (2/chunk against 50 sampling forwards). Retaining them instead makes
+        # inner-loop memory scale with frames_per_chunk with no headroom to spare at 720p:
+        # a 704x1280 chunk OOMs on a 96GB H100 at frames_per_chunk=53 (14 latent frames)
+        # while 49 (13) fits, i.e. the arm's chunk length silently decides whether TTT
+        # runs at all.
         self.pipe = pipe
         self.inner_cfg = inner_cfg
         self.infer_cfg = infer_cfg
@@ -1729,6 +1841,19 @@ class WanE2ETTTSequentialGenerator:
               f"lr={inner_cfg.inner_lr_init} clip={inner_cfg.max_inner_grad_norm} "
               f"steps={infer_cfg.ttt_steps_per_chunk}x{inner_cfg.num_gradient_steps} "
               f"mc={inner_cfg.num_mc_samples}")
+        # The anchoring route must match the one phi_0 was meta-trained under; the two put the
+        # anchor latents in different places, so a mismatch conditions on tokens the
+        # checkpoint never saw.
+        if getattr(infer_cfg, "attention_anchor", False):
+            print(f"{self._log_prefix} anchoring: attention prefix "
+                  f"(k={infer_cfg.num_anchor_latent_frames} latents"
+                  f"{' + sink' if infer_cfg.condition_on_first_frame_sink else ''}, "
+                  f"no pinned frames, no boundary trim)")
+        else:
+            print(f"{self._log_prefix} anchoring: fused first-frame "
+                  f"(condition_on_last_frame={infer_cfg.condition_on_last_frame}, "
+                  f"k={infer_cfg.num_anchor_latent_frames}, "
+                  f"sink={infer_cfg.condition_on_first_frame_sink})")
 
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
         from ..pipelines.wan_video import WanVideoUnit_PromptEmbedder
@@ -1776,7 +1901,17 @@ class WanE2ETTTSequentialGenerator:
         # Width of the local anchor block, in latent frames (k), and the number of decoded
         # frames of the preceding chunk it consumes. k=1 keeps the legacy single-frame anchor.
         k_anchor = max(1, int(getattr(icfg, "num_anchor_latent_frames", 1)))
-        sink_wanted = bool(icfg.condition_on_first_frame_sink) and bool(icfg.condition_on_last_frame)
+        # Attention anchor (plain T2V DiTs): the previous chunk's trailing k latents are
+        # prepended to the token sequence instead of overwriting this chunk's leading latents.
+        # Everything the fused route needs -- pixel-frame handoff window, contiguous VAE
+        # re-encode, boundary trimming -- falls away: the latents are handed forward directly
+        # from the sampler, and every generated frame is new content.
+        attn_anchor = bool(getattr(icfg, "attention_anchor", False))
+        prev_latents = None
+        sink_latent = None
+        sink_wanted = bool(icfg.condition_on_first_frame_sink) and (
+            attn_anchor or bool(icfg.condition_on_last_frame)
+        )
         anchor_window = anchor_overlap_pixel_frames(k_anchor, sink_wanted)
         # Running image anchor for autoregressive frame conditioning. Seeded with the
         # optional I2V image; refreshed after each chunk to that chunk's trailing
@@ -1802,21 +1937,28 @@ class WanE2ETTTSequentialGenerator:
                 tiled=icfg.tiled,
                 seed=seed + k,
             )
+            # Attention anchor: prefix this chunk's tokens with the previous chunk's trailing
+            # k latents (plus the sink). Straight from the sampler -- no decode, no re-encode,
+            # so the anchor is byte-identical to what the previous chunk actually produced.
+            if attn_anchor and prev_latents is not None:
+                call_kwargs["anchor_latents"] = attention_anchor_latents(
+                    prev_latents, k_anchor, sink_latent
+                )
             # Image-condition this chunk (TI2V-5B fused first-frame latent):
             #   - k == 0: the optional I2V seed image, if any;
             #   - k  > 0: the last frame of the previous chunk, when enabled.
-            if cond_image is not None and (k == 0 or icfg.condition_on_last_frame):
+            if not attn_anchor and cond_image is not None and (k == 0 or icfg.condition_on_last_frame):
                 call_kwargs["input_image"] = cond_image
             # k>1: hand the whole trailing window forward. `anchor_frames` supersedes
             # `input_image` inside the fused embedder, which encodes it as one clip. Only for
             # follow-up chunks -- chunk 0 has no preceding chunk, so it stays a plain
             # (optionally I2V-seeded) generation.
-            if k > 0 and icfg.condition_on_last_frame and k_anchor > 1 and cond_frames is not None:
+            if not attn_anchor and k > 0 and icfg.condition_on_last_frame and k_anchor > 1 and cond_frames is not None:
                 call_kwargs["anchor_frames"] = cond_frames
             # Sink-condition follow-up chunks on the video's very first frame, alongside
             # the sliding local anchor above.
             sink_active = (
-                k > 0 and icfg.condition_on_first_frame_sink
+                not attn_anchor and k > 0 and icfg.condition_on_first_frame_sink
                 and icfg.condition_on_last_frame and sink_image is not None
             )
             if sink_active:
@@ -1831,15 +1973,30 @@ class WanE2ETTTSequentialGenerator:
             frames, chunk_latents = self.pipe(**call_kwargs, return_latents=True)
             # The leading frames of a follow-up chunk reproduce the pinned anchor(s) rather
             # than new content; drop them to avoid a duplicate-frame seam at the boundary.
-            if k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
+            # Nothing to trim under the attention anchor: the prefix occupies its own
+            # sequence positions, so every decoded frame of this chunk is new content.
+            if not attn_anchor and k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
                 emitted = frames[num_pinned_pixel_frames(num_clean_latents(k_anchor, sink_active)):]
             else:
                 emitted = frames
             all_frames.extend(emitted)
+            # Attention anchor: hand the sampler's latents forward directly, and capture the
+            # video's first latent frame once as the fixed sink (a position-0 latent used at
+            # position 0, exactly as meta-training slices it from chunk 0).
+            if attn_anchor:
+                prev_latents = chunk_latents.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+                if prev_latents.shape[2] < k_anchor:
+                    raise ValueError(
+                        f"chunk {k} produced {prev_latents.shape[2]} latent frames but the "
+                        f"k={k_anchor} attention anchor needs {k_anchor}; raise "
+                        f"frames_per_chunk or lower num_anchor_latent_frames."
+                    )
+                if k == 0 and sink_wanted:
+                    sink_latent = prev_latents[:, :, 0:1].clone()
             # Carry the anchor forward. `anchor_window` frames for the k>1 block path (a
             # contiguous tail, re-encoded as one clip next iteration), the single last frame
             # for the legacy k=1 path.
-            if icfg.condition_on_last_frame and len(frames) > 0:
+            if not attn_anchor and icfg.condition_on_last_frame and len(frames) > 0:
                 cond_image = frames[-1]
                 cond_frames = frames[-anchor_window:] if k_anchor > 1 else None
                 if cond_frames is not None and len(cond_frames) < anchor_window:

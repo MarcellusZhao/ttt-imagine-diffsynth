@@ -1,4 +1,4 @@
-import math, warnings
+import math, time, warnings
 import torch, torchvision, imageio, os
 import imageio.v3 as iio
 from PIL import Image
@@ -114,8 +114,40 @@ class FrameSamplerByRateMixin:
         self.frame_rate = frame_rate
         self.fix_frame_rate = fix_frame_rate
 
+    # Attempts and back-off for get_reader below. Three attempts add at most ~27s of wall
+    # clock to a clip that is genuinely unreadable (the 10s ffmpeg timeout is paid each
+    # time), which is nothing against a multi-day run.
+    reader_open_retries = 3
+    reader_open_backoff_s = (2.0, 5.0)
+
     def get_reader(self, data: str):
-        return imageio.get_reader(data)
+        # imageio-ffmpeg gives the ffmpeg subprocess a HARDCODED 10s to print its header
+        # (`etime = time.time() + 10.0` in imageio_ffmpeg/_io.py::read_frames) and raises
+        # OSError("Could not load meta information") otherwise. That is a liveness deadline,
+        # not a validity check: under host memory pressure or CPU contention a perfectly good
+        # 1080p clip blows through it, and the resulting OSError propagates out of the
+        # DataLoader worker and kills the whole distributed job. Job 3998495 died this way at
+        # step 1557/1966 after 31h -- six ranks across two nodes, six DIFFERENT files, all of
+        # which re-read fine afterwards; the ffmpeg stderr in the log shows the process alive
+        # and mid-header, merely slow. Retry rather than let a transient stall end the run.
+        last_error = None
+        for attempt in range(self.reader_open_retries):
+            try:
+                return imageio.get_reader(data)
+            except FileNotFoundError:
+                # A path that does not exist will not start existing; fail fast and loudly.
+                raise
+            except OSError as e:
+                last_error = e
+                if attempt + 1 < self.reader_open_retries:
+                    warnings.warn(
+                        f"{data}: failed to open video reader "
+                        f"(attempt {attempt + 1}/{self.reader_open_retries}): {e.__class__.__name__}: {e}. "
+                        f"Retrying -- this is usually a transient ffmpeg startup stall under load, "
+                        f"not a corrupt file."
+                    )
+                    time.sleep(self.reader_open_backoff_s[min(attempt, len(self.reader_open_backoff_s) - 1)])
+        raise last_error
 
     def get_available_num_frames(self, reader):
         # NOTE on cost: `reader.count_frames()` shells out to `ffmpeg -c copy -f null -`,

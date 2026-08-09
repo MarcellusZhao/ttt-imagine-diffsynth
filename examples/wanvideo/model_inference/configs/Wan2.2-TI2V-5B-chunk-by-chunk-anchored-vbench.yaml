@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NO-ADAPTATION BASELINE (inference) — chunk-by-chunk with the full E2E-TTT
+# anchoring: wide k=3 local anchor block + first-frame sink, base model, no LoRA,
+# no test-time training.
+#
+# This is the arm an E2E-TTT VBench number is read against. Every knob below is
+# copied from Wan2.2-TI2V-5B-e2e-ttt-k3-720p-vbench.yaml (EXPERIMENT A), so the
+# LoRA memory scratchpad is the ONLY difference between the two runs:
+#
+#                        fpc  latents  pinned  new frames/chunk  num_chunks  total
+#   k=1 e2e-ttt baseline  41     11       2           36             24       869
+#   k=3 e2e-ttt (Exp. A)  49     13       4           36             24       877
+#   k=3 THIS baseline     49     13       4           36             24       877
+#
+# Keep these equal across arms — VBench metrics are length-sensitive, so a
+# different total length confounds the comparison with a length difference.
+#
+# To baseline EXPERIMENT B instead (k=3, 80 new frames/chunk @ 480p — pairs with
+# Wan2.2-TI2V-5B-e2e-ttt-k3-480p-vbench.yaml), override on the CLI:
+#     --frames_per_chunk 93 --num_chunks 11
+# To baseline the k=1 arm (Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml):
+#     --num_anchor_latent_frames 1 --frames_per_chunk 41 --num_chunks 24
+#
+# Note this differs from Wan2.2-TI2V-5B-chunk-by-chunk-vbench.yaml, which is the
+# *plain* baseline: a single last frame via native I2V (k=1, no sink). That one
+# isolates "does chunking work at all"; this one isolates the scratchpad.
+#
+# Run with:
+#   python examples/wanvideo/model_inference/vbench/Wan2.2-TI2V-5B-chunk-by-chunk-anchored-vbench.py \
+#       --config examples/wanvideo/model_inference/configs/Wan2.2-TI2V-5B-chunk-by-chunk-anchored-vbench.yaml \
+#       --save_path /path/to/out
+#
+# Sections are for readability only — just the leaf keys matter, and they must
+# match the script's argparse dest names. CLI flags override the YAML, so you can
+# pass --dimension / --start_index / --end_index / --skip_existing per process
+# when sharding.
+#
+# The 5B DiT is sharded across 3 safetensors files — passed as a NESTED list so
+# they load as a single DiT ModelConfig.
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_paths:
+    - - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/google/umt5-xxl
+  device: cuda
+
+vbench:
+  vbench_root: /home/hzhao/VBench
+  dimension: all                 # or a single dimension, e.g. object_class / temporal_flickering
+  num_videos_per_prompt: 1       # null -> 5, auto-25 when dimension == temporal_flickering
+  base_seed: 0                   # clip i uses chunk seeds base_seed + i*num_chunks + k
+
+chunking:
+  # 49 + 36*23 = 877 frames, matching the E2E-TTT arms.
+  num_chunks: 24
+  # 49 = 4n+1; 49 - 13 pinned = 36 new frames per chunk.
+  frames_per_chunk: 53
+  # k — width of the local anchor block in LATENT frames. Match the E2E-TTT arm.
+  num_anchor_latent_frames: 3
+  # Anchor each follow-up chunk on the previous chunk's trailing 4k+1 = 13 pixel
+  # frames, handed forward as ONE contiguous encode so the block carries velocity.
+  condition_on_last_frame: true
+  # Also pin the clip's very first frame as a fixed, non-sliding second anchor.
+  condition_on_sink_frame: true
+  # Trim the pinned (context, not content) frames at each chunk boundary.
+  drop_boundary_frame: true
+
+generation:
+  height: 480 # 480, 704
+  width: 832 # 832, 1280
+  num_inference_steps: 50
+  cfg_scale: 5.0
+  sigma_shift: 5.0
+  negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+output:
+  save_path: ./results/vbench/Wan2.2-TI2V-5B-chunk-by-chunk-anchored-k3-fpc53
+  fps: 16
+  quality: 5

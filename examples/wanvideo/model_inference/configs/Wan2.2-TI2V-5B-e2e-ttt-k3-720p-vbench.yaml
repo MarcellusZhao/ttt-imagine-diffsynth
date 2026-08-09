@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPERIMENT A (inference) — k=3 wide anchor, frames_per_chunk 49.
+#
+# Pairs with model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p.yaml
+# (720x1280 training; sampling stays at 480x832, exactly as the k=1 baseline does).
+# Point `lora` at that run's phi_0.
+#
+# This is the controlled arm, and at fpc=49 it is genuinely like-for-like against the
+# k=1 baseline — same chunk count, same new frames per chunk, same total length:
+#
+#                   fpc  latents  pinned  new frames/chunk  num_chunks  total
+#   k=1 baseline     41     11       2           36             24       869
+#   k=3 this config  49     13       4           36             24       877
+#
+# So the anchor width is the only variable that moved. (At fpc=41 a k=3+sink block
+# would drop this to 28 new frames per chunk, forcing a different num_chunks and
+# confounding the k comparison with a length difference — hence 49.)
+#
+# num_anchor_latent_frames MUST equal the checkpoint's
+# e2e_num_anchor_latent_frames — k sets both how many leading latents are pinned and
+# how many decoded frames each chunk hands forward, so a mismatch conditions the DiT
+# differently from meta-training and phi_0 operates off-distribution.
+#
+# Run with:
+#   python examples/wanvideo/model_inference/vbench/Wan2.2-TI2V-5B-e2e-ttt-vbench.py \
+#       --config examples/wanvideo/model_inference/configs/Wan2.2-TI2V-5B-e2e-ttt-k3-720p-vbench.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  model_paths:
+    - - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors
+      - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+    - /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  tokenizer_path: /work/nlp/hzhao/checkpoints/wan/Wan2.2-TI2V-5B/google/umt5-xxl
+  device: cuda
+
+lora:
+  # phi_0 from Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p.yaml. Set this before running —
+  # a non-existent path silently falls back to a zero-init identity adapter.
+  # lora: /work/nlp/hzhao/checkpoints/e2e-ttt/Wan2.2-TI2V-5B_e2e_ttt_fomaml_k3_720p_fpc49_antidrift_uvl_fs_rsfps16_3k/epoch-0.safetensors
+  algorithm: fomaml
+  # Must match the training run's lora_rank.
+  lora_rank: 32
+  target_modules: [q, k, v, o, ffn.0, ffn.2]
+
+inner_loop:
+  # Match the training run's inner loop — phi_0 was meta-learned for exactly this
+  # adaptation procedure, so changing steps/LR/optimizer here changes what phi_0 is
+  # optimal for. Mirrors e2e_inner_optimizer / e2e_num_gradient_steps / e2e_inner_lr /
+  # e2e_max_inner_grad_norm in Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p.yaml. `optimizer`
+  # must be set explicitly: the CLI default is `sgd`, and ttt_update_inplace now actually
+  # honours the field.
+  optimizer: adamw
+  num_gradient_steps: 2
+  num_mc_samples: 1
+  inner_lr_init: 1.0e-4
+  max_inner_grad_norm: 1.0
+
+vbench:
+  vbench_root: /home/hzhao/VBench
+  dimension: all
+  num_videos_per_prompt: 1
+  base_seed: 0
+
+chunking:
+  # Same as the k=1 baseline: 49 + 36*23 = 877 frames vs its 869. VBench metrics are
+  # length-sensitive, so keeping these equal is what makes the arms comparable.
+  num_chunks: 24
+  # 49 = 4n+1; 49 - 13 pinned = 36 new frames per chunk, matching the baseline.
+  frames_per_chunk: 49
+  # k. MUST equal the checkpoint's e2e_num_anchor_latent_frames.
+  num_anchor_latent_frames: 3
+  ttt_steps_per_chunk: 1
+  condition_on_last_frame: true
+  drop_boundary_frame: true
+  condition_on_sink_frame: true
+
+generation:
+  height: 480
+  width: 832
+  num_inference_steps: 50
+  cfg_scale: 5.0
+  sigma_shift: 5.0
+  negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+output:
+  save_path: ./results/vbench/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p-fpc49
+  fps: 16
+  quality: 5
