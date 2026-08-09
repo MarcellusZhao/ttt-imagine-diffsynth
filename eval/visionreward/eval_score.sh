@@ -1,0 +1,2 @@
+SCORES=/work/nlp/hzhao/evaluations/visionreward/causal-forcing-demos/scores
+python eval/visionreward/aggregate.py chunk-by-chunk=$SCORES/chunk-by-chunk chunk-by-chunk-anchored=$SCORES/chunk-by-chunk-anchored e2e-ttt-fomaml=$SCORES/e2e-ttt-fomaml --per_question --csv $SCORES/summary.csv

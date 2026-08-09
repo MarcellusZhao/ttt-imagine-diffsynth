@@ -1,0 +1,24 @@
+# Dependencies for the `visionreward` conda env (see setup.sh).
+#
+# VisionReward-Video is CogVLM2-video loaded with trust_remote_code. Its remote
+# modeling code passes `past_key_values` as legacy tuples and builds its own 4-D
+# attention masks, both of which transformers dropped in 4.47/5.x — so this eval
+# CANNOT share the `diffsynth` env (transformers 5.9.0 there). The pin below is the
+# version the checkpoint's config.json was written with.
+transformers==4.42.4
+tokenizers<0.20
+huggingface_hub>=0.23.0,<0.35
+
+# torch/torchvision are installed by setup.sh from the cu121 index, not from here.
+accelerate>=0.30
+decord>=0.6.0
+einops
+sentencepiece
+protobuf
+timm>=0.9.16
+# numpy 2 breaks decord's dlpack bridge against a numpy-1-built torch.
+numpy<2
+tqdm
+# pytorchvideo is intentionally NOT pinned here: it is unmaintained and fails to
+# import against modern torchvision. visionreward_video.py shims the one transform
+# the remote code needs (ShortSideScale). Install it only if you want the real thing.
