@@ -35,6 +35,12 @@ PROMPT_FILE="${PROMPT_FILE:-$SCRIPT_DIR/prompts/causal_forcing_demos.txt}"
 SAMPLE_ROOT="${SAMPLE_ROOT:-/work/nlp/hzhao/evaluations/visionreward/causal-forcing-demos}"
 LORA="${LORA:-/work/nlp/hzhao/checkpoints/e2e-ttt/Wan2.2-TI2V-5B_e2e_ttt_fomaml_k3_480p_fpc53_antidrift_uvl_fs_rsfps16_len_grouped_16k-20260804-200034/epoch-0.safetensors}"
 
+# Test-time inner-loop settings. Each MUST equal the checkpoint's meta-trained value —
+# the guard below reads them out of the checkpoint's wandb config and enforces it.
+INNER_LR="${INNER_LR:-1e-5}"
+LORA_RANK="${LORA_RANK:-128}"
+NUM_MC_SAMPLES="${NUM_MC_SAMPLES:-1}"
+
 NUM_CHUNKS="${NUM_CHUNKS:-24}"
 HEIGHT="${HEIGHT:-480}"
 WIDTH="${WIDTH:-832}"
@@ -73,6 +79,75 @@ if [ "$ARM" = "e2e-ttt-fomaml" ] && [ ! -f "$LORA" ]; then
     exit 1
 fi
 
+# Sampling must reproduce the hyper-parameters the checkpoint was meta-trained with.
+# A mismatch is invisible in the output — it just measures a different adaptation rule
+# than the one that was learned — and it has bitten this eval repeatedly:
+#   * a phi_0 trained at inner LR 1e-4 sampled at 1e-5 (10x too small), understating
+#     that arm for a whole 100-prompt run;
+#   * checkpoints trained at lora_rank 256 / num_mc_samples 2 while this script
+#     hardcoded 128 / 1.
+# Checkpoint names cannot be relied on either: the 20260804 checkpoint carries no
+# inner-lr tag despite being trained at 1e-4, and every checkpoint here is named
+# "fomaml" while its config logs e2e_algorithm: maml.
+#
+# So read the values out of the checkpoint's own wandb config and refuse to run on any
+# disagreement. Sampling flags that have no training counterpart (k, sink, fpc) are
+# already fixed by the arm definition below and are not re-derived here.
+if [ "$ARM" = "e2e-ttt-fomaml" ]; then
+    TRAINED_CFG="$(python3 - "$LORA" <<'PY'
+import glob, os, re, sys
+KEYS = ("e2e_inner_lr", "lora_rank", "e2e_num_mc_samples")
+d = os.path.dirname(sys.argv[1])
+for cfg in sorted(glob.glob(os.path.join(d, "wandb_log", "**", "config.yaml"), recursive=True)):
+    text = open(cfg).read()
+    found = {}
+    for k in KEYS:
+        m = re.search(rf"^{k}:\s*\n\s*value:\s*(\S+)", text, re.M)
+        if m:
+            found[k] = m.group(1)
+    if found:
+        print(" ".join(found.get(k, "?") for k in KEYS))
+        break
+PY
+)"
+    if [ -z "$TRAINED_CFG" ]; then
+        echo "NOTE: no wandb config beside $LORA — cannot verify hyper-parameters." >&2
+        echo "      Proceeding with INNER_LR=$INNER_LR LORA_RANK=$LORA_RANK" >&2
+        echo "      NUM_MC_SAMPLES=$NUM_MC_SAMPLES; confirm they match training." >&2
+    else
+        read -r TRAINED_LR TRAINED_RANK TRAINED_MC <<< "$TRAINED_CFG"
+        MISMATCH=""
+        chk() {  # name trained requested
+            [ "$2" = "?" ] && return 0
+            python3 -c "import sys;sys.exit(0 if abs(float('$2')-float('$3'))<=1e-12 else 1)" \
+                || MISMATCH="$MISMATCH  $1: trained=$2 requested=$3"$'\n'
+        }
+        chk "e2e_inner_lr     (INNER_LR)"       "$TRAINED_LR"   "$INNER_LR"
+        chk "lora_rank        (LORA_RANK)"      "$TRAINED_RANK" "$LORA_RANK"
+        chk "num_mc_samples   (NUM_MC_SAMPLES)" "$TRAINED_MC"   "$NUM_MC_SAMPLES"
+        if [ -n "$MISMATCH" ]; then
+            # A mismatch is occasionally intentional: holding the test-time rule fixed
+            # across checkpoints isolates phi_0 as the only variable, at the cost of
+            # adapting each by a rule it was not meta-trained for. Legitimate, but only
+            # when asked for explicitly, never by omission.
+            if [ "${ALLOW_TRAIN_TEST_MISMATCH:-${ALLOW_INNER_LR_MISMATCH:-0}}" = "1" ]; then
+                echo "WARNING: sampling does not match this checkpoint's training config:" >&2
+                printf '%s' "$MISMATCH" >&2
+                echo "         Proceeding because ALLOW_TRAIN_TEST_MISMATCH=1. The test-time" >&2
+                echo "         inner loop is NOT the one this phi_0 was meta-trained for;" >&2
+                echo "         record that with the run." >&2
+            else
+                echo "Train/test hyper-parameter mismatch for" >&2
+                echo "  $LORA" >&2
+                printf '%s' "$MISMATCH" >&2
+                echo "Re-run with the trained values, or set ALLOW_TRAIN_TEST_MISMATCH=1 if" >&2
+                echo "the mismatch is deliberate." >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
 # RUN_NAME names the output subdirectory, defaulting to the arm. Override it to keep
 # several runs of the SAME arm side by side under one SAMPLE_ROOT — most often one
 # e2e-ttt-fomaml directory per phi_0 checkpoint. Without it a second checkpoint would
@@ -98,7 +173,11 @@ echo "Arm:        $ARM${RUN_NAME:+  (run: $RUN_NAME)}"
 echo "Prompts:    $NUM_PROMPTS (shard $SHARD_INDEX/$NUM_SHARDS of $PROMPT_FILE)"
 echo "Geometry:   ${HEIGHT}x${WIDTH}, $NUM_CHUNKS chunks"
 echo "Output:     $OUT_DIR/<prompt[:30]>/"
-[ "$ARM" = "e2e-ttt-fomaml" ] && echo "LoRA:       $LORA"
+if [ "$ARM" = "e2e-ttt-fomaml" ]; then
+    echo "LoRA:       $LORA"
+    echo "Inner loop: lr=$INNER_LR rank=$LORA_RANK mc=$NUM_MC_SAMPLES" \
+         "(trained: lr=${TRAINED_LR:-?} rank=${TRAINED_RANK:-?} mc=${TRAINED_MC:-?})"
+fi
 echo
 
 COMMON=(
@@ -132,8 +211,9 @@ case "$ARM" in
         python "$DRIVERS/Wan2.2-TI2V-5B-e2e-ttt-custom.py" \
             "${COMMON[@]}" --num_chunks "$NUM_CHUNKS" --frames_per_chunk 53 \
             --algorithm fomaml --lora "$LORA" \
-            --optimizer adamw --num_gradient_steps 2 --lora_rank 128 \
-            --num_anchor_latent_frames 3 --inner_lr_init 1e-5
+            --optimizer adamw --num_gradient_steps 2 --lora_rank "$LORA_RANK" \
+            --num_mc_samples "$NUM_MC_SAMPLES" \
+            --num_anchor_latent_frames 3 --inner_lr_init "$INNER_LR"
         ;;
 esac
 
