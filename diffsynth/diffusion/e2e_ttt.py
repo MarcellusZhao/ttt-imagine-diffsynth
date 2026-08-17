@@ -33,9 +33,13 @@ Targets ``Wan2.1-T2V-1.3B`` and ``Wan2.2-TI2V-5B`` (single-DiT Wan pipelines).
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import random
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+import time
+from dataclasses import dataclass, field, replace
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -212,6 +216,73 @@ class InferenceConfig:
     # time, keeps every generated latent supervised, and produces no boundary frame to trim.
     # Mutually exclusive with the fused path; see ``attention_anchor_latents``.
     attention_anchor: bool = False
+    # Use the pretrained I2V conditioning of a `require_vae_embedding` DiT (Wan2.1-Fun-*-InP,
+    # Wan2.1-I2V-*) as the anchor -- the route Stable-Video-Infinity uses. See
+    # ``build_i2v_conditioning``. Mutually exclusive with both routes above.
+    i2v_anchor: bool = False
+    # Motion-window width in PIXEL frames (SVI's --num_motion_frames). 1 reproduces stock I2V
+    # single-frame conditioning; 5 gives real content to the first two latent frames, which is
+    # what carries velocity across a chunk boundary. Only used when `i2v_anchor`.
+    num_motion_frames: int = 5
+    # SVI's --ref_pad_num: what fills the non-motion pixel slots of `y`. 0 = zeros, -1 = the
+    # sink/reference frame in every slot ("padding for ID consistency"), n > 0 = the first n.
+    ref_pad_num: int = -1
+
+
+def motion_latent_frames(num_motion_pixel_frames: int) -> int:
+    """Latent frames that receive real motion content from an ``m``-pixel-frame window.
+
+    Inverse of ``num_pinned_pixel_frames``: the causal VAE gives latent 0 pixel frame 0 and each
+    later latent frame the next four, so ``m = 1 -> 1``, ``5 -> 2``, ``9 -> 3``, ``13 -> 4``.
+    SVI-Film's ``--num_motion_frames 5`` is therefore a two-latent window.
+    """
+    return (max(1, int(num_motion_pixel_frames)) - 1) // 4 + 1
+
+
+def build_i2v_conditioning(
+    pipe,
+    motion_frames: List,
+    num_frames: int,
+    height: int,
+    width: int,
+    *,
+    ref_frame=None,
+    ref_pad_num: int = -1,
+) -> Dict[str, torch.Tensor]:
+    """Build ``(y, clip_feature)`` for one chunk through the DiT's *pretrained* I2V conditioning.
+
+    This is the E2E-TTT i2v anchor route, ported from Stable-Video-Infinity
+    (``diffsynth/pipelines/svi_video.py::encode_images_adaptive``), which conditions
+    Wan2.1-I2V-14B-480P exactly this way. ``motion_frames`` is the preceding chunk's trailing
+    window (PIL frames); ``ref_frame`` is the video's fixed reference image, used as `y` padding.
+
+    Deliberately routed through the pipeline's own ``WanVideoUnit_ImageEmbedderVAE`` /
+    ``..._ImageEmbedderCLIP`` rather than reimplemented here, so meta-training and sampling build
+    byte-identical tensors. That equality is the failure mode that silently broke the 720p fused
+    arm (tiled vs untiled encode), and it is not something to re-derive in two places.
+
+    Returns detached tensors: `y` and `clip_feature` depend only on pixels, never on the LoRA
+    state or the timestep, so they are built ONCE per chunk and are not part of the meta-graph.
+    """
+    from ..pipelines.wan_video import WanVideoUnit_ImageEmbedderVAE, WanVideoUnit_ImageEmbedderCLIP
+
+    out: Dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        vae_out = WanVideoUnit_ImageEmbedderVAE().process(
+            pipe, input_image=None, end_image=None, anchor_frames=list(motion_frames),
+            sink_image=ref_frame, ref_pad_num=ref_pad_num,
+            num_frames=num_frames, height=height, width=width,
+            tiled=False, tile_size=(30, 52), tile_stride=(15, 26),
+        )
+        if "y" in vae_out:
+            out["y"] = vae_out["y"].detach()
+        clip_out = WanVideoUnit_ImageEmbedderCLIP().process(
+            pipe, input_image=None, end_image=None, anchor_frames=list(motion_frames),
+            height=height, width=width,
+        )
+        if "clip_feature" in clip_out:
+            out["clip_feature"] = clip_out["clip_feature"].detach()
+    return out
 
 
 def attention_anchor_latents(
@@ -612,6 +683,190 @@ def make_training_scheduler(sigma_shift: float = 5.0) -> FlowMatchScheduler:
 # --------------------------------------------------------------------------- #
 
 
+class _SharedSlotArray:
+    """One replay buffer shared by every rank on ONE node, backed by an mmap'd file.
+
+    Why this exists: the buffers are per-process today, so an N-GPU node holds N identical-
+    in-distribution copies and pays N times the host RAM -- which is the binding constraint
+    on the 720p arms (see the ErrorRecycler docstring). Mapping one arena per node cuts that
+    by N *and* raises diversity: today each rank draws from its own ``k`` samples, whereas
+    here every rank draws from all ``k``, which is closer to SVI (it ``all_gather``s; the
+    per-process buffers were our simplification, not its design).
+
+    **No collective communication.** This is a shared memory mapping, not synchronised
+    distributed state: nothing crosses the node boundary, NCCL is untouched, and the
+    D2H/H2D copies are exactly the ones the per-process path already performs. The only new
+    costs are cross-socket NUMA traffic on the far ranks and first-touch page faults.
+
+    **Lock-free by construction.** Writes never race because each local rank owns a disjoint
+    slot range (``[lo, hi)``) of every grid. Reads use a per-slot sequence number: the writer
+    bumps it to odd before touching the payload and to even after, so a reader that sees an
+    odd value, or a different value after copying, knows it raced. It then returns ``None``
+    -- which this code already treats as an ordinary miss that injects nothing -- so no retry
+    loop or lock is needed anywhere. Aligned 4-byte loads/stores are atomic on x86-64 and TSO
+    forbids the store-store reordering that would break the protocol.
+
+    Layout, one file per buffer kind::
+
+        seq     uint32  [num_grids, k]   0 = never written, odd = being written, even = valid
+        sigma   float32 [num_grids, k]   harvest sigma, per sample (see ErrorRecycler)
+        payload uint8   [num_grids, k, itemsize * prod(shape)]
+
+    The shape is FIXED at creation, so a differently-shaped harvest is skipped at write time
+    rather than stored and missed at read time -- same injection behaviour, less memory.
+    """
+
+    _HDR = 0  # payload starts after seq + sigma; offsets computed in __init__
+
+    def __init__(self, path: str, num_grids: int, k: int, shape, dtype: torch.dtype,
+                 local_rank: int, local_world: int, timeout_s: float = 120.0):
+        import numpy as np
+
+        self.np = np
+        self.num_grids, self.k = int(num_grids), int(k)
+        self.shape = tuple(int(s) for s in shape)
+        self.dtype = dtype
+        self.itemsize = torch.empty(0, dtype=dtype).element_size()
+        self.sample_bytes = self.itemsize * int(np.prod(self.shape))
+        # Disjoint write region per local rank; every rank READS the whole array.
+        lo = (self.k * int(local_rank)) // int(local_world)
+        hi = (self.k * (int(local_rank) + 1)) // int(local_world)
+        if hi <= lo:  # more ranks than slots -- give this rank one slot rather than none
+            lo, hi = min(int(local_rank), self.k - 1), min(int(local_rank), self.k - 1) + 1
+        self.lo, self.hi = lo, hi
+
+        n_slots = self.num_grids * self.k
+        self._seq_bytes = n_slots * 4
+        self._sig_bytes = n_slots * 4
+        self._pay_bytes = n_slots * self.sample_bytes
+        total = self._seq_bytes + self._sig_bytes + self._pay_bytes
+
+        self._ensure_file(path, total, timeout_s)
+        self.seq = np.memmap(path, dtype=np.uint32, mode="r+", offset=0,
+                             shape=(self.num_grids, self.k))
+        self.sigma = np.memmap(path, dtype=np.float32, mode="r+", offset=self._seq_bytes,
+                               shape=(self.num_grids, self.k))
+        self.payload = np.memmap(path, dtype=np.uint8, mode="r+",
+                                 offset=self._seq_bytes + self._sig_bytes,
+                                 shape=(self.num_grids, self.k, self.sample_bytes))
+        self.path = path
+        self.nbytes = total
+
+    @staticmethod
+    def _ensure_file(path: str, total: int, timeout_s: float) -> None:
+        """Create the arena exactly once per node, then let every rank map the same inode.
+
+        A lock file elects a single creator via ``O_EXCL``; it builds under a temp name and
+        ``os.rename``s into place, which is atomic, so no rank can ever map a half-built file
+        or a different inode. The file is created sparse (``truncate``), so the pages cost
+        nothing until they are first touched.
+        """
+        if os.path.exists(path):
+            return
+        lock = path + ".lock"
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            deadline = time.time() + timeout_s
+            while not os.path.exists(path):
+                if time.time() > deadline:
+                    raise TimeoutError(
+                        f"timed out waiting for the shared error arena at {path}; "
+                        f"remove {lock} if it is stale.")
+                time.sleep(0.05)
+            return
+        try:
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "wb") as f:
+                f.truncate(total)  # sparse: no disk written until a page is touched
+            os.rename(tmp, path)   # atomic publish
+        finally:
+            os.close(fd)
+
+    def _write_slot(self, grid: int, payload_u8, sigma: float) -> None:
+        region = self.seq[grid, self.lo:self.hi]
+        empty = self.np.flatnonzero(region == 0)
+        i = self.lo + (int(empty[0]) if empty.size else random.randrange(self.hi - self.lo))
+        self.seq[grid, i] += 1              # -> odd: "being written"
+        self.payload[grid, i] = payload_u8
+        self.sigma[grid, i] = sigma
+        self.seq[grid, i] += 1              # -> even: "valid"
+
+    def add(self, tensor: torch.Tensor, sigma: float, grid: int) -> bool:
+        """Store one sample. Returns False (and stores nothing) on a shape mismatch."""
+        if tuple(tensor.shape) != self.shape or tensor.dtype != self.dtype:
+            return False
+        flat = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+        self._write_slot(int(grid), flat, float(sigma))
+        return True
+
+    def _valid_slots(self, grid: int):
+        s = self.np.asarray(self.seq[grid])
+        return self.np.flatnonzero((s != 0) & ((s & 1) == 0))
+
+    def sample(self, grid: int, exclude_idx: Optional[int] = None):
+        """Draw one ``(tensor, sigma, idx)`` from ``grid``; ``None`` on empty or a torn read."""
+        valid = self._valid_slots(int(grid))
+        if exclude_idx is not None and valid.size > 1:
+            valid = valid[valid != int(exclude_idx)]
+        if valid.size == 0:
+            return None
+        i = int(valid[random.randrange(valid.size)])
+        s0 = int(self.seq[grid, i])
+        if s0 == 0 or (s0 & 1):
+            return None
+        buf = self.np.array(self.payload[grid, i])   # copy out before re-checking seq
+        sig = float(self.sigma[grid, i])
+        if int(self.seq[grid, i]) != s0:
+            return None                              # raced with a write -> ordinary miss
+        t = torch.from_numpy(buf).view(self.dtype).reshape(self.shape)
+        return t, sig, i
+
+    def sample_any_grid(self, exclude_idx: Optional[int] = None):
+        """Pooled draw across every grid (the anchor buffer's read path)."""
+        grids = [g for g in range(self.num_grids) if self._valid_slots(g).size]
+        if not grids:
+            return None
+        return self.sample(grids[random.randrange(len(grids))], exclude_idx=exclude_idx)
+
+    def num_samples(self) -> int:
+        s = self.np.asarray(self.seq)
+        return int(((s != 0) & ((s & 1) == 0)).sum())
+
+    def nonempty_grids(self) -> int:
+        s = self.np.asarray(self.seq)
+        return int((((s != 0) & ((s & 1) == 0)).any(axis=1)).sum())
+
+
+def shared_arena_bytes(num_grids: int, k: int, latent_shape, num_anchor_frames: int = 3,
+                       itemsize: int = 2) -> Dict[str, float]:
+    """Host bytes one node's shared arenas occupy, and the largest ``k`` a budget allows.
+
+    ``latent_shape`` is one chunk latent ``(C, T, H, W)`` in LATENT units. Returns GB figures
+    plus ``k_per_GB`` so a memory budget can be inverted directly (see ``max_shared_k``).
+    """
+    import math
+
+    c, t, h, w = (int(x) for x in latent_shape)
+    resid = c * t * h * w * itemsize
+    anchor = c * max(1, int(num_anchor_frames)) * h * w * itemsize
+    per_slot = resid + anchor + 8  # + seq(4) + sigma(4)
+    total = num_grids * k * per_slot
+    return {
+        "residual_MB": resid / 1e6,
+        "anchor_MB": anchor / 1e6,
+        "per_k_GB": num_grids * per_slot / 1e9,
+        "total_GB": total / 1e9,
+    }
+
+
+def max_shared_k(budget_gb: float, num_grids: int, latent_shape,
+                 num_anchor_frames: int = 3, itemsize: int = 2) -> int:
+    """Largest ``error_buffer_k`` whose shared (per-node) arenas fit in ``budget_gb``."""
+    per_k = shared_arena_bytes(num_grids, 1, latent_shape, num_anchor_frames, itemsize)["per_k_GB"]
+    return int(budget_gb // per_k)
+
+
 class ErrorRecycler:
     """Recycled-error buffers following Stable-Video-Infinity (arXiv:2510.09212;
     reference implementation ``Stable-Video-Infinity/train_svi.py``), adapted to
@@ -637,10 +892,25 @@ class ErrorRecycler:
         drifted previous-chunk frame the anchor actually is at inference.
 
     Mirrors SVI's ``LightningModelForTrain_onestage`` buffer machinery:
-      * two buffers, harvested via the two one-shot ``step(..., to_final=True)``
-        extrapolations (SVI train_svi.py:1151-1160): ``noise_error_buffer`` holds
-        noise-direction errors (SVI's ``latent_error_buffer``) and
-        ``y_error_buffer`` holds data-direction errors (SVI's ``y_error_buffer``);
+      * SVI keeps TWO buffers, harvested via the two one-shot
+        ``step(..., to_final=True)`` extrapolations (SVI train_svi.py:1151-1160):
+        ``latent_error_buffer`` for noise-direction errors and ``y_error_buffer``
+        for data-direction ones. **We store ONE**, because with
+        ``d = noise_pred - training_target`` the two extrapolations are exactly
+
+            noise_error =  d * (1 - sigma)        y_error = -d * sigma
+
+        i.e. the same residual at two scales -- the ``noisy_latents`` term cancels
+        out of both. ``residual_buffer`` therefore holds ``(d, sigma)`` pairs and
+        ``sample_noise_error`` / ``sample_latent_error`` apply their coefficient on
+        the way out. This is an identity, not an approximation: injected values are
+        elementwise what the two separate buffers produced, at half the bytes. Two
+        details make it exact -- ``sigma`` is stored PER SAMPLE (the harvest sigma
+        comes from the training scheduler and is finer-grained than the grid it is
+        filed under, so re-deriving it from ``_get_timestep_grid`` would add a
+        bucketing error), and ``d`` is stored raw rather than pre-scaled (recovering
+        it from a stored ``noise_error`` would divide by ``1 - sigma``, which is
+        ill-conditioned at the high-noise end that ``sigma_shift=5.0`` favours).
       * ``num_grids`` buckets keyed by the nearest timestep of a simulated
         ``num_grids``-step inference schedule (SVI's ``_get_timestep_grid``), so
         injected errors match the errors made at that point of a real sampling
@@ -651,15 +921,31 @@ class ErrorRecycler:
       * intensity modulation by ``uniform(1-f, 1+f)`` (``error_modulate_factor``).
 
     Simplifications vs SVI (all safe to revisit later):
-      * NO ``all_gather`` warmup -- buffers are per-process and filled from local
-        errors only. ``buffer_warmup_iter`` instead gates when *injection* starts,
-        so the first few outer steps only collect. E2E-TTT harvests
-        ``num_mem_steps x num_mc_samples`` errors per outer step (vs SVI's 1), so
-        local buckets fill quickly without cross-GPU sync.
+      * NO ``all_gather`` warmup. By default buffers are per-process and filled from local
+        errors only; ``buffer_warmup_iter`` instead gates when *injection* starts, so the
+        first few outer steps only collect. E2E-TTT harvests ``num_mem_steps x
+        num_mc_samples`` errors per outer step (vs SVI's 1), so local buckets fill quickly
+        without cross-GPU sync. Passing ``shared_buffer_dir`` switches to ONE arena per
+        NODE (``_SharedSlotArray``) -- still no collective communication, just a shared
+        mmap -- which cuts host RAM by the local world size and lets every rank draw from
+        every rank's samples. See ``_SharedSlotArray`` for the protocol and
+        ``max_shared_k`` for sizing.
       * only the random replacement strategy (SVI's default and fastest).
 
-    CPU memory = 2 buffers x num_grids x error_buffer_k x one chunk-latent tensor
-    (e.g. ~2 MB for a TI2V-5B 21-frame 704x1280 chunk -> ~6 GB at 50 x 32).
+    CPU memory = (1 full-chunk buffer + 1 anchor buffer) x num_grids x error_buffer_k,
+    and it is HOST RAM (`_add_error_to_buffer` does `.cpu()`), which on these nodes is
+    the binding constraint -- not GPU. Size it in BYTES, not samples: the cost scales
+    with resolution, chunk length and latent channels, none of which the `k` knob
+    mentions. Worked example, TI2V-5B at 704x1280 / frames_per_chunk 53 (48 x 14 x 44
+    x 80 bf16 = 4.73 MB per chunk latent, 1.01 MB per 3-frame anchor slice):
+
+        k=96 -> 22.7 + 4.9  = 27.6 GB/rank     (50.3 GB before the merge)
+        k=50 -> 11.8 + 2.5  = 14.3 GB/rank     (26.2 GB before)
+
+    The buffers fill slowly -- saturating around step 700 on a 16k-clip epoch -- so an
+    oversized `k` looks healthy for hours before the run is OOM-killed mid-epoch.
+    Watch `err_buffer/miss_rate`: at 0 the buffers are already larger than the
+    injection coverage needs, and `k` can come down for free.
     """
 
     def __init__(
@@ -667,13 +953,14 @@ class ErrorRecycler:
         num_grids: int = 50,
         error_buffer_k: int = 32,
         buffer_warmup_iter: int = 20,
-        noise_prob: float = 0.9,
+        noise_prob: float = 0.01,
         latent_prob: float = 0.9,
         y_prob: float = 0.9,
-        clean_prob: float = 0.1,
+        clean_prob: float = 0.5,
         error_modulate_factor: float = 0.0,
         sigma_shift: float = 5.0,
         anchor_sample_from_all_grids: bool = True,
+        shared_buffer_dir: Optional[str] = None,
     ):
         # Simulated inference schedule: one grid per inference timestep (SVI builds
         # this with get_timesteps(num_inference_steps=num_grids, shift=5.0)).
@@ -690,12 +977,20 @@ class ErrorRecycler:
         self.clean_prob = float(clean_prob)
         self.error_modulate_factor = float(error_modulate_factor)
         num_grids = len(timesteps)
-        # SVI naming note: SVI's `latent_error_buffer` stores the noise-direction
-        # errors and feeds the *noise* injection; its `y_error_buffer` stores the
-        # data-direction errors and feeds both the *latent* and *y* injections.
-        # We name the first one `noise_error_buffer` for clarity.
-        self.noise_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
-        self.y_error_buffer: Dict[int, List[torch.Tensor]] = {i: [] for i in range(num_grids)}
+        self.num_grids_actual = num_grids  # set_timesteps_wan may not return exactly num_grids
+        # ONE buffer for both full-chunk injections -- see the class docstring. Entries are
+        # `(d, sigma)` with `d = noise_pred - training_target` and `sigma` the harvest sigma
+        # of that sample; `sample_noise_error` returns `d * (1 - sigma)` and
+        # `sample_latent_error` returns `d * (-sigma)`, which is exactly what SVI's separate
+        # `latent_error_buffer` / `y_error_buffer` held.
+        self.residual_buffer: Dict[int, List[Tuple[torch.Tensor, float]]] = {i: [] for i in range(num_grids)}
+        # Index of the residual the noise injection just used, so a latent injection in the
+        # SAME prediction draw samples WITHOUT replacement. With two separate buffers the two
+        # draws almost surely hit different harvest events; sharing one bucket would otherwise
+        # let them collide with probability 1/k and inject two exactly collinear errors.
+        # Set by sample_noise_error, consumed (and cleared) by sample_latent_error, and reset
+        # per draw in draw_injection_flags.
+        self._last_residual_idx: Optional[int] = None
         # Dedicated anchor-error buffer. At inference the anchor is the previous chunk's
         # *last k generated frames*, so its drift is a terminal, data-space error of that
         # k-frame block -- a different distribution from the mid-trajectory, full-chunk data
@@ -707,6 +1002,32 @@ class ErrorRecycler:
         # Anchor drift is terminal (data-space, timestep-independent), so it is not tied to
         # the current denoising timestep: sampling from any grid maximises buffer use.
         self.anchor_sample_from_all_grids = bool(anchor_sample_from_all_grids)
+        # --- per-NODE shared arenas (opt-in). Lazily built on the first harvest, because the
+        # chunk shape is only known then; until they exist the per-process dicts above are
+        # used, so a run with `shared_buffer_dir` set behaves identically for the first few
+        # samples and then switches. Both arenas are keyed by shape, so a mixed-resolution
+        # dataset simply keeps using the per-process path for the odd-shaped clips.
+        # `${SLURM_JOB_ID}` / `$TMPDIR` / `~` are expanded, so a config can name a per-job
+        # node-local directory without the launcher having to interpolate it.
+        _sbd = shared_buffer_dir or os.environ.get("E2E_TTT_SHARED_BUFFER_DIR")
+        if _sbd:
+            _sbd = os.path.expanduser(os.path.expandvars(_sbd))
+            # `expandvars` leaves an UNSET variable in place, so `${TMPDIR}/x` with no TMPDIR
+            # would otherwise silently create a literal "${TMPDIR}" directory -- in the cwd,
+            # i.e. on shared storage, which is the one place this must never live. Refuse it:
+            # a config naming a variable the compute node does not set is a mistake, and the
+            # per-rank fallback it would trigger is what `error_buffer_k` was sized against.
+            if "$" in _sbd:
+                raise ValueError(
+                    f"--e2e_shared_buffer_dir resolved to {_sbd!r}: an environment variable in "
+                    f"it is not set on this node. Point it at a real node-local path (and see "
+                    f"the config comment on why it must not be tmpfs), or unset the option and "
+                    f"lower e2e_error_buffer_k to what a PER-RANK buffer can afford."
+                )
+        self.shared_buffer_dir = _sbd or None
+        self._shared_residual: Optional["_SharedSlotArray"] = None
+        self._shared_anchor: Optional["_SharedSlotArray"] = None
+        self._shared_failed = False  # one-shot: never retry a failed mapping mid-run
         self.iteration_count = 0
         self.num_harvested = 0
         # --- diagnostics surfaced via stats() (all cheap running scalars) ---
@@ -749,12 +1070,143 @@ class ErrorRecycler:
         # #1 harvested error scale, as per-element RMS so noise/y/anchor are comparable.
         self._harv_rms_sum[tag] += float(error_sample.detach().float().pow(2).mean().sqrt())
         self._harv_rms_cnt[tag] += 1
+        if buffer is self.anchor_error_buffer:
+            shared = self._ensure_shared("anchor", error_sample)
+            # sigma is unused for the anchor (it stores a pre-scaled y-error slice); pass 0.
+            if shared is not None and shared.add(error_sample, 0.0, grid_idx):
+                self.num_harvested += 1
+                return
         error_cpu = error_sample.detach().cpu()
         bucket = buffer[grid_idx]
         if len(bucket) < self.error_buffer_size:
             bucket.append(error_cpu)
         else:
             bucket[random.randint(0, len(bucket) - 1)] = error_cpu
+        self.num_harvested += 1
+
+    # ------------------------------------------------------------------ shared arenas
+    @staticmethod
+    def _local_topology() -> Tuple[int, int]:
+        """(local_rank, local_world_size) on this node — the write-partition key.
+
+        ONLY torchrun/accelerate's `LOCAL_RANK` / `LOCAL_WORLD_SIZE` are trusted, and both
+        must be present or this reports a single process.
+
+        The SLURM_* variables look like the obvious fallback and are WRONG for this repo's
+        multi-node launcher, which runs `--ntasks-per-node=1` and lets accelerate fork the 4
+        local ranks itself: `SLURM_NTASKS_PER_NODE` is 1 (not 4) and `SLURM_LOCALID` is 0 for
+        the single srun task and is inherited unchanged by every forked rank. Believing them
+        would hand all four ranks the identical write region `[0, k)`, so they would silently
+        overwrite each other's slots -- no crash (the seqlock keeps reads safe), just a
+        quarter of the intended diversity. Reporting (0, 1) instead is always SAFE: one rank
+        owning every slot is exactly correct for a single process, and merely conservative
+        for several.
+        """
+        lr, lw = os.environ.get("LOCAL_RANK"), os.environ.get("LOCAL_WORLD_SIZE")
+        if lr is None or lw is None:
+            return 0, 1
+        try:
+            return max(0, int(lr)), max(1, int(lw))
+        except ValueError:
+            return 0, 1
+
+    def _ensure_shared(self, kind: str, sample: torch.Tensor) -> Optional["_SharedSlotArray"]:
+        """Map (creating once per node) the shared arena for `kind`, or None to fall back.
+
+        Any failure -- no numpy, unwritable directory, a filesystem that cannot mmap -- is
+        caught once, logged, and latched off: the per-process buffers keep the run alive
+        rather than a memory optimisation taking training down.
+        """
+        attr = "_shared_residual" if kind == "residual" else "_shared_anchor"
+        got = getattr(self, attr)
+        if got is not None or self._shared_failed or not self.shared_buffer_dir:
+            return got
+        try:
+            local_rank, local_world = self._local_topology()
+            shape = tuple(sample.shape)
+            # Key on everything that changes the layout, so a resumed/relaunched job with a
+            # different geometry can never map an incompatible leftover arena.
+            tag = "-".join(str(x) for x in (
+                kind, self.num_grids_actual, self.error_buffer_size,
+                *shape, str(sample.dtype).replace("torch.", "")))
+            job = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+            os.makedirs(self.shared_buffer_dir, exist_ok=True)
+            path = os.path.join(self.shared_buffer_dir, f"e2e_ttt_errbuf_{job}_{tag}.bin")
+            arena = _SharedSlotArray(
+                path, self.num_grids_actual, self.error_buffer_size, shape, sample.dtype,
+                local_rank, local_world,
+            )
+            setattr(self, attr, arena)
+            if local_rank == 0:
+                # Print the DETECTED topology, not the intended one: if LOCAL_WORLD_SIZE is
+                # missing this says "1 local rank" while 4 processes are running, which is the
+                # only visible symptom of the partitions collapsing onto each other.
+                print(f"[E2E-TTT] shared {kind} error arena: {arena.nbytes / 1e9:.1f} GB at "
+                      f"{path} | detected {local_world} local rank(s), this rank owns slots "
+                      f"[{arena.lo}, {arena.hi}) of {self.error_buffer_size} "
+                      f"(per-rank buffers would be {local_world * arena.nbytes / 1e9:.1f} GB "
+                      f"node-wide)")
+            return arena
+        except Exception as exc:  # noqa: BLE001 -- never let this kill a training run
+            self._shared_failed = True
+            # LOUD, with the number that matters: `error_buffer_k` is usually sized ON THE
+            # ASSUMPTION that sharing works (k=500 is only affordable pooled), so a silent
+            # fallback turns a memory optimisation into a guaranteed OOM-kill several hundred
+            # steps later, once the per-rank buffers fill. Print the per-rank footprint here so
+            # it is visible in the first seconds of the log rather than inferred from a crash.
+            _, local_world = self._local_topology()
+            per_rank_gb = (self.num_grids_actual * self.error_buffer_size
+                           * sample.numel() * sample.element_size() / 1e9)
+            print(f"[E2E-TTT] WARNING: shared error buffer unavailable ({exc!r}); "
+                  f"falling back to PER-PROCESS buffers.\n"
+                  f"[E2E-TTT]          At error_buffer_k={self.error_buffer_size} that is "
+                  f"~{per_rank_gb:.0f} GB/rank for the {kind} buffer alone, i.e. "
+                  f"~{per_rank_gb * local_world:.0f} GB across {local_world} local ranks. "
+                  f"If k was sized for the SHARED path, lower it or fix the directory now.")
+            return None
+
+    def release_shared(self) -> None:
+        """Unlink this node's arenas. Best-effort: a SIGKILL (the cgroup OOM path) cannot run
+        it, which is why the files live on scratch rather than /dev/shm -- a leak then costs
+        disk, and the pages are reclaimable page cache rather than pinned tmpfs."""
+        for attr in ("_shared_residual", "_shared_anchor"):
+            arena = getattr(self, attr, None)
+            if arena is None:
+                continue
+            setattr(self, attr, None)
+            for p in (arena.path, arena.path + ".lock"):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def _add_residual_to_buffer(self, residual: torch.Tensor, sigma: float, timestep) -> None:
+        """Store one ``(d, sigma)`` pair, serving BOTH full-chunk injections.
+
+        Same random-replacement eviction as ``_add_error_to_buffer``; the difference is that
+        one insertion now covers what used to be two (see the class docstring). ``sigma`` rides
+        with the sample rather than being re-derived from the grid, which is what keeps the
+        reconstruction exact.
+        """
+        grid_idx = self._get_timestep_grid(timestep)
+        # #1 harvested error scale. RMS is homogeneous -- rms(d * c) == |c| * rms(d) -- so both
+        #    per-type series are recoverable from one pass over `d`, and stay numerically
+        #    identical to what the two separate buffers reported.
+        rms_d = float(residual.detach().float().pow(2).mean().sqrt())
+        self._harv_rms_sum["noise"] += rms_d * abs(1.0 - sigma)
+        self._harv_rms_cnt["noise"] += 1
+        self._harv_rms_sum["y"] += rms_d * abs(sigma)
+        self._harv_rms_cnt["y"] += 1
+        shared = self._ensure_shared("residual", residual)
+        if shared is not None and shared.add(residual, float(sigma), grid_idx):
+            self.num_harvested += 1
+            return
+        entry = (residual.detach().cpu(), float(sigma))
+        bucket = self.residual_buffer[grid_idx]
+        if len(bucket) < self.error_buffer_size:
+            bucket.append(entry)
+        else:
+            bucket[random.randint(0, len(bucket) - 1)] = entry
         self.num_harvested += 1
 
     def _record_injection(self, tag: str, err: torch.Tensor, like: torch.Tensor) -> None:
@@ -769,12 +1221,18 @@ class ErrorRecycler:
         or the stored shape does not match (mixed-resolution datasets)."""
         self._inj_req[tag] += 1  # #2 count the attempt (miss = returns None below)
         grid_idx = self._get_timestep_grid(timestep)
-        bucket = buffer[grid_idx]
-        if not bucket:
-            return None
-        error_sample = random.choice(bucket)
-        if error_sample.shape != like.shape:
-            return None
+        if buffer is self.anchor_error_buffer and self._shared_anchor is not None:
+            drawn = self._shared_anchor.sample(grid_idx)
+            if drawn is None or tuple(drawn[0].shape) != tuple(like.shape):
+                return None
+            error_sample = drawn[0]
+        else:
+            bucket = buffer[grid_idx]
+            if not bucket:
+                return None
+            error_sample = random.choice(bucket)
+            if error_sample.shape != like.shape:
+                return None
         error_sample = error_sample.to(device=like.device, dtype=like.dtype)
         intensity_mod = random.uniform(1.0 - self.error_modulate_factor, 1.0 + self.error_modulate_factor)
         error_sample = error_sample * intensity_mod
@@ -786,10 +1244,16 @@ class ErrorRecycler:
         (SVI's ``y_error_sample_from_all_grids``). Used for the anchor error, whose
         terminal/data-space drift is not tied to the current denoising timestep."""
         self._inj_req[tag] += 1  # #2 count the attempt (miss = returns None below)
-        pooled = [s for bucket in buffer.values() for s in bucket if s.shape == like.shape]
-        if not pooled:
-            return None
-        error_sample = random.choice(pooled).to(device=like.device, dtype=like.dtype)
+        if buffer is self.anchor_error_buffer and self._shared_anchor is not None:
+            drawn = self._shared_anchor.sample_any_grid()
+            if drawn is None or tuple(drawn[0].shape) != tuple(like.shape):
+                return None
+            error_sample = drawn[0].to(device=like.device, dtype=like.dtype)
+        else:
+            pooled = [s for bucket in buffer.values() for s in bucket if s.shape == like.shape]
+            if not pooled:
+                return None
+            error_sample = random.choice(pooled).to(device=like.device, dtype=like.dtype)
         intensity_mod = random.uniform(1.0 - self.error_modulate_factor, 1.0 + self.error_modulate_factor)
         error_sample = error_sample * intensity_mod
         self._record_injection(tag, error_sample, like)
@@ -834,46 +1298,108 @@ class ErrorRecycler:
         training_target = training_target.detach()
         noisy_latents = noisy_latents.detach()
 
-        x_0_pred = noisy_latents + noise_pred * (1.0 - sigma)
-        noise_corr_gt = noisy_latents + training_target * (1.0 - sigma)
-        noise_error = x_0_pred - noise_corr_gt
-
-        x_1_pred = noisy_latents + noise_pred * (0.0 - sigma)
-        latent_corr_gt = noisy_latents + training_target * (0.0 - sigma)
-        y_error = x_1_pred - latent_corr_gt
+        # Both of SVI's one-shot extrapolations reduce to the SAME residual at two scales --
+        # `noisy_latents` cancels, leaving
+        #     noise_error = (noisy + pred*(1-s)) - (noisy + tgt*(1-s)) =  d * (1 - s)
+        #     y_error     = (noisy + pred*(0-s)) - (noisy + tgt*(0-s)) = -d * s
+        # so we compute `d` once, store it once with its sigma, and let the samplers apply
+        # the coefficient. The anchor buffer keeps storing a pre-scaled y-error slice: it has
+        # its own population (predict-step, anchored branches only) and its own read path
+        # (`anchor_sample_from_all_grids`), so folding it in would change which distribution
+        # the anchor injection draws from.
+        residual = noise_pred - training_target
 
         k_anchor = max(1, int(num_anchor_frames))
-        if attention_anchor and y_error.shape[2] >= k_anchor:
+        num_latents = residual.shape[2]
+        # The anchor buffer wants the y-error of the trailing k frames only, so scale the
+        # SLICE rather than materialising a full-chunk y_error (1 MB vs 4.7 MB at 720p, and
+        # nothing at all when neither branch fires).
+        anchor_y_error = lambda: residual[:, :, -k_anchor:] * (-sigma)
+        if attention_anchor and num_latents >= k_anchor:
             # Attention anchor: nothing is pinned, so every frame's extrapolated error is
             # genuine and the full-chunk buffers stay untouched. The chunk's last k latents
             # still become the next chunk's anchor block verbatim, so their terminal error is
             # exactly the drift that block will carry -- harvest it as one coherent slice.
-            self._add_error_to_buffer(self.anchor_error_buffer, y_error[:, :, -k_anchor:], timestep, "anchor")
-        elif condition_on_first_frame and y_error.shape[2] >= num_clean_frames + k_anchor:
+            self._add_error_to_buffer(self.anchor_error_buffer, anchor_y_error(), timestep, "anchor")
+        elif condition_on_first_frame and num_latents >= num_clean_frames + k_anchor:
             # The last k frames' data-direction error is the terminal error of frames
             # generated from a (possibly drifted) context -- exactly the anchor drift. Taken
             # as one slice so the block stays temporally coherent, and guarded so it can never
             # overlap the pinned leading frames (whose "error" is meaningless, see above).
-            self._add_error_to_buffer(self.anchor_error_buffer, y_error[:, :, -k_anchor:], timestep, "anchor")
+            self._add_error_to_buffer(self.anchor_error_buffer, anchor_y_error(), timestep, "anchor")
             # The leading anchor frame(s) are pinned: their extrapolated error is garbage,
-            # so keep the full-chunk buffers uniform in shape by zeroing them rather than
-            # dropping them.
-            noise_error = noise_error.clone(); noise_error[:, :, 0:num_clean_frames] = 0
-            y_error = y_error.clone(); y_error[:, :, 0:num_clean_frames] = 0
+            # so keep the full-chunk buffer uniform in shape by zeroing them rather than
+            # dropping them. Zeroing `residual` zeroes BOTH derived errors, since each is a
+            # scalar multiple of it -- exactly what zeroing the two buffers separately did.
+            # The anchor slice above is taken before this and cannot overlap it (the branch
+            # guard requires T >= num_clean_frames + k_anchor).
+            residual = residual.clone(); residual[:, :, 0:num_clean_frames] = 0
 
-        self._add_error_to_buffer(self.noise_error_buffer, noise_error, timestep, "noise")
-        self._add_error_to_buffer(self.y_error_buffer, y_error, timestep, "y")
+        self._add_residual_to_buffer(residual, sigma, timestep)
+
+    def _sample_residual(self, timestep, like: torch.Tensor, tag: str, exclude_idx: Optional[int] = None):
+        """Draw one stored ``(d, sigma)`` from the current timestep grid.
+
+        Returns ``(d_on_device, sigma, idx)`` or ``None``. Miss semantics are the same as
+        ``_sample_error_from_buffer``: an empty grid or a shape that does not match ``like``
+        (mixed-resolution datasets) injects nothing rather than raising. ``exclude_idx``
+        makes the second draw of a single prediction step sample without replacement.
+        """
+        self._inj_req[tag] += 1  # #2 count the attempt (miss = returns None below)
+        grid_idx = self._get_timestep_grid(timestep)
+        if self._shared_residual is not None:
+            drawn = self._shared_residual.sample(grid_idx, exclude_idx=exclude_idx)
+            if drawn is None:
+                return None
+            d, sigma, idx = drawn
+            if tuple(d.shape) != tuple(like.shape):
+                return None
+            return d.to(device=like.device, dtype=like.dtype), sigma, idx
+        bucket = self.residual_buffer[grid_idx]
+        if not bucket:
+            return None
+        if exclude_idx is not None and len(bucket) > 1:
+            idx = random.choice([i for i in range(len(bucket)) if i != exclude_idx])
+        else:
+            idx = random.randrange(len(bucket))
+        d, sigma = bucket[idx]
+        if d.shape != like.shape:
+            return None
+        return d.to(device=like.device, dtype=like.dtype), sigma, idx
+
+    def _finish_injection(self, err: torch.Tensor, like: torch.Tensor, tag: str) -> torch.Tensor:
+        """Intensity modulation + bookkeeping, shared by both residual-derived injections."""
+        err = err * random.uniform(1.0 - self.error_modulate_factor, 1.0 + self.error_modulate_factor)
+        self._record_injection(tag, err, like)
+        return err
 
     @torch.no_grad()
     def sample_noise_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
-        """Noise-direction error for `noise = noise + err` injection."""
-        return self._sample_error_from_buffer(self.noise_error_buffer, timestep, like, "noise")
+        """Noise-direction error for `noise = noise + err` injection: ``d * (1 - sigma)``."""
+        drawn = self._sample_residual(timestep, like, "noise")
+        if drawn is None:
+            return None
+        d, sigma, idx = drawn
+        # Remember which entry went into the noise injection so a latent injection in this
+        # same draw picks a different one (see `_last_residual_idx`).
+        self._last_residual_idx = idx
+        return self._finish_injection(d * (1.0 - sigma), like, "noise")
 
     @torch.no_grad()
     def sample_latent_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
-        """Data-direction error for `latents = latents + err` injection (SVI samples
-        this from the y_error buffer -- see `_sample_latent_error_from_latent_buffer`)."""
-        return self._sample_error_from_buffer(self.y_error_buffer, timestep, like, "y")
+        """Data-direction error for `latents = latents + err` injection: ``d * (-sigma)``.
+
+        SVI draws this from its `y_error_buffer`; here it is the same shared residual under
+        the other coefficient. Consumes `_last_residual_idx` so the without-replacement
+        exclusion applies only within the draw that set it -- the memorize-side call, which
+        is the only other caller, is unaffected.
+        """
+        exclude_idx, self._last_residual_idx = self._last_residual_idx, None
+        drawn = self._sample_residual(timestep, like, "y", exclude_idx=exclude_idx)
+        if drawn is None:
+            return None
+        d, sigma, _ = drawn
+        return self._finish_injection(d * (-sigma), like, "y")
 
     @torch.no_grad()
     def sample_anchor_error(self, timestep, like: torch.Tensor) -> Optional[torch.Tensor]:
@@ -894,7 +1420,13 @@ class ErrorRecycler:
     def draw_injection_flags(self) -> Dict[str, bool]:
         """Per-draw injection decision for the GENERATION (predict) objective
         (SVI train_svi.py:1090-1111): independent noise/latent/y gates, overridden
-        to all-clean with prob `clean_prob`."""
+        to all-clean with prob `clean_prob`.
+
+        Also opens a new sampling scope: this is called exactly once at the top of each
+        prediction draw, so clearing `_last_residual_idx` here scopes the
+        without-replacement exclusion to the noise/latent pair of THIS draw.
+        """
+        self._last_residual_idx = None
         if not self.inject_active:
             return {"noise": False, "latent": False, "y": False}
         flags = {
@@ -921,16 +1453,32 @@ class ErrorRecycler:
         return True
 
     def stats(self) -> Dict[str, float]:
+        if self._shared_residual is not None:
+            _res_n, _res_grids = self._shared_residual.num_samples(), self._shared_residual.nonempty_grids()
+        else:
+            _res_n = sum(len(v) for v in self.residual_buffer.values())
+            _res_grids = sum(1 for v in self.residual_buffer.values() if v)
+        if self._shared_anchor is not None:
+            _anc_n, _anc_grids = self._shared_anchor.num_samples(), self._shared_anchor.nonempty_grids()
+        else:
+            _anc_n = sum(len(v) for v in self.anchor_error_buffer.values())
+            _anc_grids = sum(1 for v in self.anchor_error_buffer.values() if v)
         out = {
-            "err_buffer/noise_nonempty_grids": float(sum(1 for v in self.noise_error_buffer.values() if v)),
-            "err_buffer/y_nonempty_grids": float(sum(1 for v in self.y_error_buffer.values() if v)),
-            "err_buffer/anchor_nonempty_grids": float(sum(1 for v in self.anchor_error_buffer.values() if v)),
-            "err_buffer/anchor_samples": float(sum(len(v) for v in self.anchor_error_buffer.values())),
-            "err_buffer/total_samples": float(
-                sum(len(v) for v in self.noise_error_buffer.values())
-                + sum(len(v) for v in self.y_error_buffer.values())
-                + sum(len(v) for v in self.anchor_error_buffer.values())
-            ),
+            # Occupancy. NOTE these keys changed when the noise and y buffers were merged:
+            # `residual_*` replaces the old `noise_*` / `y_*` pair, which tracked two buffers
+            # that are now one. `total_samples` is still the true count of resident tensors --
+            # the quantity host RSS tracks linearly -- so it is directly comparable across the
+            # change and should roughly HALVE. The per-injection-type series below
+            # (harv_rms_*, miss_rate_*, inject_rel_*) are unaffected and stay comparable.
+            # When the shared arenas are active these count the NODE-wide pool, which every
+            # rank draws from -- so all local ranks report the same value and it is no longer
+            # a per-process figure. `shared` flags which regime a run is in.
+            "err_buffer/residual_nonempty_grids": float(_res_grids),
+            "err_buffer/residual_samples": float(_res_n),
+            "err_buffer/anchor_nonempty_grids": float(_anc_grids),
+            "err_buffer/anchor_samples": float(_anc_n),
+            "err_buffer/total_samples": float(_res_n + _anc_n),
+            "err_buffer/shared": float(self._shared_residual is not None),
             "err_buffer/num_harvested": float(self.num_harvested),
             "err_buffer/num_injected": float(sum(self._inj_ok.values())),
             "err_buffer/inject_active": float(self.inject_active),
@@ -1049,6 +1597,9 @@ def compute_flow_matching_loss(
     sink_frame: Optional[torch.Tensor] = None,
     num_anchor_latent_frames: int = 1,
     anchor_latents: Optional[torch.Tensor] = None,
+    y: Optional[torch.Tensor] = None,
+    clip_feature: Optional[torch.Tensor] = None,
+    num_motion_latent_frames: int = 1,
     dit=None,
     error_recycler: Optional[ErrorRecycler] = None,
     inject_memorize_error: bool = False,
@@ -1108,11 +1659,24 @@ def compute_flow_matching_loss(
     dropped from the loss, and the chunk keeps every latent it has. That is what makes this
     route usable on a plain T2V DiT with no fused first-frame conditioning at all, and why the
     caller chunks contiguously rather than with an overlap.
+
+    ``y`` / ``clip_feature`` are the THIRD route -- the pretrained I2V conditioning of a
+    ``require_vae_embedding`` DiT (Wan2.1-Fun-*-InP, Wan2.1-I2V-*), built by
+    ``build_i2v_conditioning``. They pass straight through to ``model_fn``, and are mutually
+    exclusive with the two routes above. Note the loss stays **unmasked** on this route: nothing
+    is pinned in the latent stream, so the leading frames are still noised and still supervised
+    and the model reconstructs them *from* ``y``, exactly as in I2V pretraining. The anchor's
+    cost is therefore paid in new content per chunk (the caller overlaps chunks and trims the
+    boundary), not in supervision.
     """
-    if anchor_latents is not None and (condition_on_first_frame or sink_frame is not None):
+    _active = [name for name, on in (
+        ("condition_on_first_frame/sink_frame (fused)", bool(condition_on_first_frame) or sink_frame is not None),
+        ("anchor_latents (attention prefix)", anchor_latents is not None),
+        ("y/clip_feature (i2v)", y is not None),
+    ) if on]
+    if len(_active) > 1:
         raise ValueError(
-            "anchor_latents (attention anchor) and condition_on_first_frame/sink_frame (fused "
-            "anchor) are two different conditioning mechanisms; pass exactly one."
+            "E2E-TTT anchoring routes are mutually exclusive; got " + " + ".join(_active)
         )
     if x0.dim() != 5:
         raise ValueError(f"Expected x0 [B,C,T,H,W], got {tuple(x0.shape)}")
@@ -1230,6 +1794,24 @@ def compute_flow_matching_loss(
                     local_anchor = local_anchor + a_err
             anchor = torch.cat([sink_frame, local_anchor], dim=2) if sink_frame is not None else local_anchor
             latents = torch.cat([anchor, latents[:, :, num_clean:]], dim=2)
+        y_in = y
+        if y_in is not None and error_recycler is not None and inject_anchor_error and injection_flags["y"]:
+            # SVI's y-error injection on its native channel: at inference the motion window is
+            # the previous chunk's *generated* (hence drifted) tail, so phi_0 must be
+            # meta-learned under that corruption. Two things are scoped deliberately:
+            #   * only the 16 IMAGE-LATENT channels are perturbed -- the 4 leading mask channels
+            #     are a structural flag, and noising them corrupts "which frames are given"
+            #     rather than "what they look like";
+            #   * only the leading `n_motion` latent frames, the ones carrying real motion
+            #     content. The rest of `y` is padding: either zeros, or the fixed reference
+            #     frame, which is captured once and never drifts.
+            n_motion = min(max(1, int(num_motion_latent_frames)), y_in.shape[2])
+            img = y_in[:, 4:, :n_motion]
+            a_err = error_recycler.sample_anchor_error(timestep, like=img)
+            if a_err is not None:
+                y_in = torch.cat(
+                    [y_in[:, :4], torch.cat([img + a_err, y_in[:, 4:, n_motion:]], dim=2)], dim=1
+                )
         anchor_in = anchor_latents
         if anchor_in is not None and error_recycler is not None and inject_anchor_error and injection_flags["y"]:
             # Same SVI y-error injection as the fused path, applied to the prefix block: at
@@ -1249,6 +1831,8 @@ def compute_flow_matching_loss(
             fuse_vae_embedding_in_latents=condition_on_first_frame,
             num_fused_clean_frames=num_clean,
             anchor_latents=anchor_in,
+            y=y_in,
+            clip_feature=clip_feature,
         )
         if error_recycler is not None and harvest_errors:
             # Recycle this draw's own prediction error into the buffers (SVI
@@ -1269,10 +1853,15 @@ def compute_flow_matching_loss(
                 # so those draws are skipped. condition_on_first_frame routes the last
                 # frame's terminal error to the anchor buffer and drops the pinned leading
                 # frame(s).
+                # The i2v route pins nothing, so like the attention prefix its whole-chunk errors
+                # are all genuine; what becomes the next anchor is the chunk's trailing
+                # `num_motion_latent_frames` latents, so that is the block width to harvest.
+                _prefix_like = anchor_latents is not None or y is not None
                 error_recycler.harvest(
                     scheduler, noise_pred, target, latents, timestep,
                     condition_on_first_frame=condition_on_first_frame, num_clean_frames=num_clean,
-                    num_anchor_frames=k_anchor, attention_anchor=anchor_latents is not None,
+                    num_anchor_frames=num_motion_latent_frames if y is not None else k_anchor,
+                    attention_anchor=_prefix_like,
                     source="predict",
                 )
         if condition_on_first_frame:
@@ -1320,6 +1909,7 @@ def _run_reptile_inner_loop(
     learned_lrs: Optional[MetaLearnedLRSchedule] = None,
     use_gradient_checkpointing: bool = False,
     write_back: bool = False,
+    memorize_condition: Optional[Dict[str, torch.Tensor]] = None,
     error_recycler: Optional[ErrorRecycler] = None,
 ):
     """Reptile meta-update.
@@ -1367,6 +1957,8 @@ def _run_reptile_inner_loop(
                     pipe, scheduler, chunks[k], ctx, inner_cfg,
                     params_override={**current},
                     use_gradient_checkpointing=use_gradient_checkpointing,
+                    y=(memorize_condition or {}).get("y"),
+                    clip_feature=(memorize_condition or {}).get("clip_feature"),
                     error_recycler=error_recycler,
                     inject_memorize_error=True, harvest_errors=True,
                 )
@@ -1427,6 +2019,9 @@ def run_meta_inner_loop(
     condition_on_first_frame_sink: bool = True,
     num_anchor_latent_frames: int = 1,
     attention_anchor: bool = False,
+    video_conditions: Optional[List[List[Optional[Dict[str, torch.Tensor]]]]] = None,
+    memorize_condition: Optional[Dict[str, torch.Tensor]] = None,
+    num_motion_latent_frames: int = 1,
     error_recycler: Optional[ErrorRecycler] = None,
 ):
     """Memorize->predict inner loop over chunk sequences (MAML / FOMAML / Reptile).
@@ -1463,6 +2058,21 @@ def run_meta_inner_loop(
     k+1 itself stays fully noised and fully supervised. It expects CONTIGUOUS, NON-OVERLAPPING
     chunks -- the anchor is read from the preceding chunk directly, not from an overlap -- and
     is mutually exclusive with ``condition_on_first_frame``.
+
+    ``video_conditions`` selects the third route (i2v, ``require_vae_embedding`` DiTs): a
+    per-video list parallel to ``video_chunks`` whose entry ``k`` is the ``{y, clip_feature}``
+    dict conditioning the *prediction of chunk k* (so entry 0 is unused/``None``). The caller
+    builds them once per chunk with ``build_i2v_conditioning`` -- they depend only on pixels, so
+    keeping them out of this loop keeps the VAE and CLIP towers off the meta-graph. Like the
+    other routes it expects overlap-chunked input, here by ``num_motion_frames`` PIXEL frames.
+
+    ``memorize_condition`` is what the MEMORIZE objective is given, on every route that needs it.
+    The memorize step stays semantically unconditioned everywhere -- it is "reproduce this clip",
+    and it must stay identical to the test-time ``ttt_update_inplace`` -- but a
+    ``require_vae_embedding`` DiT cannot forward at all without a ``y`` (its patch_embedding
+    wants 16 + 20 channels). So on the i2v route the caller passes the NULL conditioning here:
+    an all-zero mask over all-zero latents, i.e. "no frames are given", which is unconditioned in
+    content while still satisfying the architecture. Leave it ``None`` on the other routes.
     """
     if attention_anchor and condition_on_first_frame:
         raise ValueError(
@@ -1484,6 +2094,7 @@ def run_meta_inner_loop(
             learned_lrs=learned_lrs,
             use_gradient_checkpointing=use_gradient_checkpointing,
             write_back=write_back,
+            memorize_condition=memorize_condition,
             error_recycler=error_recycler,
         )
     first_order = algorithm != "maml"  # FOMAML drops the Hessian
@@ -1516,9 +2127,10 @@ def run_meta_inner_loop(
 
     final_lora: Optional[Dict[str, torch.Tensor]] = None
 
-    for chunks, ctx in zip(video_chunks, video_contexts):
+    for video_idx, (chunks, ctx) in enumerate(zip(video_chunks, video_contexts)):
         if len(chunks) < 2:
             continue  # need >=2 chunks to form a memorize->predict pair
+        conds = video_conditions[video_idx] if video_conditions is not None else None
 
         # Fresh LoRA init phi_0 for this video; clone keeps the graph to the real leaves.
         current_lora: Dict[str, torch.Tensor] = {n: base_params[n].clone() for n in lora_names}
@@ -1543,6 +2155,8 @@ def run_meta_inner_loop(
                     pipe, scheduler, chunks[k], ctx, inner_cfg,
                     params_override=params_override,
                     use_gradient_checkpointing=use_gradient_checkpointing,
+                    y=(memorize_condition or {}).get("y"),
+                    clip_feature=(memorize_condition or {}).get("clip_feature"),
                     error_recycler=error_recycler,
                     inject_memorize_error=True, harvest_errors=True,
                 )
@@ -1583,6 +2197,9 @@ def run_meta_inner_loop(
                 attention_anchor_latents(chunks[k], num_anchor_latent_frames, sink_frame)
                 if attention_anchor else None
             )
+            # i2v route: the conditioning for predicting chunk k+1 was built once, from chunk k's
+            # trailing motion window, by the caller.
+            cond = (conds[k + 1] or {}) if conds is not None and k + 1 < len(conds) else {}
             loss_pred = compute_flow_matching_loss(
                 pipe, scheduler, chunks[k + 1], ctx, inner_cfg,
                 params_override={**current_lora},
@@ -1591,9 +2208,12 @@ def run_meta_inner_loop(
                 sink_frame=None if attention_anchor else sink_frame,
                 num_anchor_latent_frames=num_anchor_latent_frames,
                 anchor_latents=anchor_prefix,
+                y=cond.get("y"),
+                clip_feature=cond.get("clip_feature"),
+                num_motion_latent_frames=num_motion_latent_frames,
                 error_recycler=error_recycler,
                 inject_generation_error=True,
-                inject_anchor_error=condition_on_first_frame or attention_anchor,
+                inject_anchor_error=condition_on_first_frame or attention_anchor or ("y" in cond),
                 # Harvest the predict step's genuine corrupted-input (compounding) errors:
                 # full-chunk noise/data errors into the shared buffers and the last frame's
                 # terminal error into the anchor buffer. Noise-injected draws are skipped
@@ -1622,6 +2242,293 @@ def run_meta_inner_loop(
     }
     stats.update(_inner_adapt_stats(base_params, final_lora, lora_names, device))
     return meta_loss, stats
+
+
+# --------------------------------------------------------------------------- #
+# Test-time inner-loop diagnostics                                            #
+# --------------------------------------------------------------------------- #
+
+
+class TTTDiagnostics:
+    """Per-step instrumentation of the test-time inner loop, for the question "why does
+    quality fall off as the chunk index grows".
+
+    The scratchpad is reset to phi_0 once per *video* and then adapted monotonically for
+    ``(num_chunks - 1) * ttt_steps_per_chunk * num_gradient_steps`` optimizer steps with no
+    reset in between, so by the last chunk phi sits much further from phi_0 than anything
+    meta-training explored (the training clips' chunk counts bound the inner-loop depth
+    phi_0 was ever optimized for). This class measures exactly that: how big each update
+    is, where phi has drifted to, and whether the scratchpad has stopped fitting.
+
+    **Why the existing per-chunk loss print cannot answer this.** ``compute_flow_matching_loss``
+    draws ONE random timestep per MC sample (``torch.randint(min_ts, max_ts, (1,))``) and the
+    inference configs set ``num_mc_samples: 1``, so the logged memorize loss is a single-sample
+    estimate at a random sigma. Flow-matching loss varies by more than an order of magnitude
+    across sigma, which swamps any trend across 23 chunks. Every number here that is meant to
+    be compared *across chunks* is therefore measured on a FIXED probe: ``torch.random.fork_rng``
+    + a fixed seed pins both the timestep and the noise, so the same (t, eps) draws are reused
+    at every chunk and the only thing that moves is phi (and, for ``probe_self``, the chunk).
+
+    Three families of number, written as JSONL:
+
+      * ``kind="step"`` -- one per optimizer step. Gradient norm before/after
+        ``_per_tensor_clip``, the displacement the optimizer actually applied
+        (``step_norm``, measured on the fp32 master, i.e. what survived), the cumulative
+        ``drift`` from phi_0, and ``precond_gain = step_norm / (lr * grad_norm_post)``.
+        That last one is the AdamW tell: a preconditioned step moves each coordinate by
+        ~lr regardless of how small the gradient got, so if the memorize loss flattens
+        while ``precond_gain`` climbs, the optimizer is still walking at full speed on
+        noise. Split A/B because lora_B is zero-init: its *relative* drift is the one that
+        can blow past 1 while the aggregate looks tame.
+      * ``kind="chunk"`` -- one per chunk. ``delta_w_ratio`` is the only gauge-invariant
+        magnitude here: ||scaling * B @ A||_F summed over LoRA'd modules, over
+        ||W_base||_F. A/B norms individually are gauge-dependent (B*A is invariant to
+        A -> cA, B -> B/c), so this is what actually says how hard the adapter is pulling
+        on the base model.
+      * the two probes, also on ``kind="chunk"``:
+        - ``probe_self``  -- current phi against the chunk just generated. "Does the
+          scratchpad still fit what it is being asked to memorize?"
+        - ``probe_chunk0`` -- current phi against chunk 0's latents, held fixed for the
+          whole video. Nothing in it varies but phi, so a rise is unambiguous: the
+          scratchpad is overwriting the start of the video. This is the direct measurement
+          of the forgetting that long-video drift looks like.
+
+    Cost is ``2 * num_probe_seeds`` extra forwards per chunk against 50 sampling steps
+    (x2 for CFG), i.e. a few percent, and nothing at all when the driver does not ask for
+    it -- every hook is a single ``is not None`` check.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        num_probe_seeds: int = 2,
+        probe_reference_chunk: bool = True,
+        probe_delta_w: bool = True,
+    ):
+        self.path = path
+        self.num_probe_seeds = max(0, int(num_probe_seeds))
+        self.probe_reference_chunk = bool(probe_reference_chunk)
+        self.probe_delta_w = bool(probe_delta_w)
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        self._fh = open(path, "a")
+        self.video: Optional[str] = None
+        self.chunk: int = -1
+        self.global_step: int = 0
+        self.step_in_chunk: int = 0
+        self._phi0: Optional[Dict[str, torch.Tensor]] = None
+        self._phi0_norms: Dict[str, float] = {}
+        self._lr: float = 0.0
+        self._clip: float = 0.0
+        self._ref_latents: Optional[torch.Tensor] = None
+        self._ref_context: Optional[torch.Tensor] = None
+        print(f"[E2E-TTT] inner-loop diagnostics -> {path}")
+
+    # -- bookkeeping ------------------------------------------------------- #
+
+    @staticmethod
+    def _group(name: str) -> str:
+        if ".lora_A." in name:
+            return "A"
+        if ".lora_B." in name:
+            return "B"
+        return "other"
+
+    @classmethod
+    def _group_norms(cls, tensors: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """L2 norm over all tensors, and over the lora_A / lora_B subsets separately."""
+        acc = {"all": 0.0, "A": 0.0, "B": 0.0, "other": 0.0}
+        for name, t in tensors.items():
+            if t is None:
+                continue
+            sq = float(t.detach().float().pow(2).sum())
+            acc["all"] += sq
+            acc[cls._group(name)] += sq
+        return {k: math.sqrt(v) for k, v in acc.items()}
+
+    def attach(self, updater: "TestTimeInnerOptimizer", inner_cfg: InnerLoopConfig, *, video: str) -> None:
+        """Call once per video, right after the scratchpad has been reset to phi_0 and the
+        updater built -- at that moment ``updater.master`` IS phi_0, in fp32."""
+        self._phi0 = {n: t.clone() for n, t in updater.master.items()}
+        self._phi0_norms = self._group_norms(self._phi0)
+        self._lr = float(inner_cfg.inner_lr_init)
+        self._clip = float(inner_cfg.max_inner_grad_norm)
+        self.video = video
+        self.chunk = -1
+        self.global_step = 0
+        self.step_in_chunk = 0
+        self._ref_latents = None
+        self._ref_context = None
+
+    def begin_chunk(self, chunk_index: int) -> None:
+        self.chunk = int(chunk_index)
+        self.step_in_chunk = 0
+
+    def _write(self, record: dict) -> None:
+        record = {"video": self.video, "chunk": self.chunk, **record}
+        self._fh.write(json.dumps(record) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None and not self._fh.closed:
+            self._fh.close()
+
+    # -- per-step ---------------------------------------------------------- #
+
+    @torch.no_grad()
+    def record_step(
+        self,
+        updater: "TestTimeInnerOptimizer",
+        grads: Dict[str, Optional[torch.Tensor]],
+        before: Dict[str, torch.Tensor],
+        loss: float,
+    ) -> None:
+        """One optimizer step's worth of magnitudes. ``before`` is the fp32 master snapshot
+        taken immediately before ``opt.step``, so ``step_norm`` is the displacement that was
+        actually realized rather than the one the update rule nominally asked for."""
+        step_delta = {n: updater.master[n] - before[n] for n in updater.names}
+        drift = {n: updater.master[n] - self._phi0[n] for n in updater.names}
+        # The same drift as the DiT actually sees it. The optimizer runs on an fp32 master
+        # but writes back into bf16 leaves, and bf16's quantum at LoRA's parameter scale
+        # (~7e-5) is comparable to an inner step, so the live weights lag the master. The
+        # master says what the update rule asked for; this says what the forward pass got.
+        # A widening gap means the readback is eating the update -- the failure mode that
+        # made the pre-master in-place bf16 `sub_` discard most of itself.
+        live = {n: p.detach().float() - self._phi0[n] for n, p in zip(updater.names, updater.params)}
+        pre = {n: g for n, g in grads.items() if g is not None}
+        post = {n: _per_tensor_clip(g, self._clip) for n, g in pre.items()}
+        n_clipped = sum(1 for g in pre.values() if float(g.norm()) > self._clip) if self._clip > 0 else 0
+
+        g_pre = self._group_norms(pre)
+        g_post = self._group_norms(post)
+        s = self._group_norms(step_delta)
+        d = self._group_norms(drift)
+        dl = self._group_norms(live)
+        # SGD under the same clip would move a tensor by at most lr in Frobenius norm; AdamW's
+        # preconditioner moves each COORDINATE by ~lr instead. The ratio is the amplification.
+        denom = self._lr * g_post["all"]
+        self.global_step += 1
+        self.step_in_chunk += 1
+        self._write({
+            "kind": "step",
+            "global_step": self.global_step,
+            "step_in_chunk": self.step_in_chunk,
+            "loss": float(loss),
+            "grad_norm_pre_clip": g_pre["all"],
+            "grad_norm_post_clip": g_post["all"],
+            "num_tensors": len(pre),
+            "num_tensors_clipped": n_clipped,
+            "step_norm": s["all"],
+            "step_norm_A": s["A"],
+            "step_norm_B": s["B"],
+            "drift_norm": d["all"],
+            "drift_ratio": d["all"] / (self._phi0_norms["all"] + 1e-12),
+            "drift_ratio_A": d["A"] / (self._phi0_norms["A"] + 1e-12),
+            "drift_ratio_B": d["B"] / (self._phi0_norms["B"] + 1e-12),
+            # As the DiT sees it, after the bf16 write-back.
+            "drift_norm_live": dl["all"],
+            "drift_ratio_live": dl["all"] / (self._phi0_norms["all"] + 1e-12),
+            "live_over_master": dl["all"] / (d["all"] + 1e-12),
+            "precond_gain": (s["all"] / denom) if denom > 0 else None,
+        })
+
+    # -- per-chunk --------------------------------------------------------- #
+
+    @torch.no_grad()
+    def _delta_w_ratio(self, dit: nn.Module) -> Optional[float]:
+        """||scaling * B @ A||_F / ||W_base||_F, summed over every LoRA'd module.
+
+        The only magnitude here that does not depend on the A/B gauge, and the one that says
+        how hard the adapter is actually pulling on the pretrained weights."""
+        num_sq, den_sq = 0.0, 0.0
+        for module in dit.modules():
+            a = getattr(module, "lora_A", None)
+            b = getattr(module, "lora_B", None)
+            base = getattr(module, "base_layer", None)
+            if a is None or b is None or base is None or not hasattr(base, "weight"):
+                continue
+            for key in a.keys():
+                if key not in b:
+                    continue
+                aw = a[key].weight.detach().float()
+                bw = b[key].weight.detach().float()
+                scaling = float(getattr(module, "scaling", {}).get(key, 1.0))
+                num_sq += float((scaling * (bw @ aw)).pow(2).sum())
+                den_sq += float(base.weight.detach().float().pow(2).sum())
+        if den_sq <= 0:
+            return None
+        return math.sqrt(num_sq) / math.sqrt(den_sq)
+
+    @torch.no_grad()
+    def _probe_loss(
+        self, pipe, scheduler, x0, context, inner_cfg, *, memorize_condition, use_gradient_checkpointing
+    ) -> Optional[float]:
+        """Memorize loss on FIXED (timestep, noise) draws, averaged over ``num_probe_seeds``.
+
+        ``fork_rng`` pins the global RNG that ``compute_flow_matching_loss`` draws its timestep
+        and noise from, and restores it afterwards -- so the probe is comparable across chunks
+        AND does not perturb the sampling stream (chunk seeds would otherwise shift and the
+        arm would stop matching its no-adaptation ablation clip for clip)."""
+        if self.num_probe_seeds <= 0 or x0 is None:
+            return None
+        probe_cfg = replace(inner_cfg, num_mc_samples=1)
+        total = 0.0
+        for seed in range(self.num_probe_seeds):
+            with torch.random.fork_rng(devices=[x0.device] if x0.device.type == "cuda" else []):
+                torch.manual_seed(1234 + seed)
+                if x0.device.type == "cuda":
+                    torch.cuda.manual_seed_all(1234 + seed)
+                loss = compute_flow_matching_loss(
+                    pipe, scheduler, x0, context, probe_cfg,
+                    params_override=None,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    y=(memorize_condition or {}).get("y"),
+                    clip_feature=(memorize_condition or {}).get("clip_feature"),
+                )
+            total += float(loss.detach())
+        return total / self.num_probe_seeds
+
+    @torch.no_grad()
+    def record_chunk(
+        self,
+        pipe,
+        scheduler,
+        inner_cfg: InnerLoopConfig,
+        *,
+        x0,
+        context,
+        memorize_condition=None,
+        use_gradient_checkpointing: bool = False,
+        when: str = "post_update",
+    ) -> None:
+        """One chunk-level record. ``when="pre_update"`` should be taken with the chunk just
+        generated but before its memorize step, so ``probe_self`` reads as "how well does the
+        scratchpad adapted on chunks 0..k-1 already explain chunk k" -- the generalization the
+        meta-objective is supposed to buy. ``when="post_update"`` reads as fit quality."""
+        # Fix chunk 0 as the reference the whole video is measured against.
+        if self.probe_reference_chunk and self._ref_latents is None and x0 is not None:
+            self._ref_latents = x0.detach().clone()
+            self._ref_context = context.detach().clone()
+        probe_self = self._probe_loss(
+            pipe, scheduler, x0, context, inner_cfg,
+            memorize_condition=memorize_condition,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+        )
+        probe_chunk0 = None
+        if self.probe_reference_chunk and self._ref_latents is not None:
+            probe_chunk0 = self._probe_loss(
+                pipe, scheduler, self._ref_latents, self._ref_context, inner_cfg,
+                memorize_condition=memorize_condition,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+            )
+        self._write({
+            "kind": "chunk",
+            "when": when,
+            "global_step": self.global_step,
+            "probe_self": probe_self,
+            "probe_chunk0": probe_chunk0,
+            "delta_w_ratio": self._delta_w_ratio(pipe.dit) if self.probe_delta_w else None,
+        })
 
 
 # --------------------------------------------------------------------------- #
@@ -1684,19 +2591,33 @@ class TestTimeInnerOptimizer:
         }
 
     @torch.no_grad()
-    def apply(self, grads: Sequence[Optional[torch.Tensor]]) -> None:
+    def apply(
+        self,
+        grads: Sequence[Optional[torch.Tensor]],
+        *,
+        diag: Optional["TTTDiagnostics"] = None,
+        loss: float = 0.0,
+    ) -> None:
         """One optimizer step: advance the fp32 master from ``grads``, then write it back
         into the live bf16 parameters. Grads are upcast so the clipping and the moment
         updates are computed in fp32. ``max_inner_grad_norm`` is applied inside the
         optimizer (``_per_tensor_clip``), the same call the meta-trained inner loop makes,
-        rather than re-implemented here."""
+        rather than re-implemented here.
+
+        ``diag`` (optional) records the step's magnitudes. It snapshots the master before
+        the step so the logged displacement is the one actually realized, not the nominal
+        one -- the distinction that mattered when the update was still an in-place bf16
+        ``sub_`` discarding most of itself."""
         grad_map = {
             n: (g.detach().float() if g is not None else None)
             for n, g in zip(self.names, grads)
         }
+        before = {n: t.clone() for n, t in self.master.items()} if diag is not None else None
         self.master = self.opt.step(self.master, grad_map)
         for name, p in zip(self.names, self.params):
             p.copy_(self.master[name].to(dtype=p.dtype))
+        if diag is not None:
+            diag.record_step(self, grad_map, before, loss)
 
 
 def ttt_update_inplace(
@@ -1708,6 +2629,8 @@ def ttt_update_inplace(
     *,
     use_gradient_checkpointing: bool = False,
     updater: Optional[TestTimeInnerOptimizer] = None,
+    memorize_condition: Optional[Dict[str, torch.Tensor]] = None,
+    diag: Optional[TTTDiagnostics] = None,
 ) -> float:
     """``inner_cfg.num_gradient_steps`` first-order LoRA updates applied in place (no
     second-order graph). Used between chunks at test time. Returns the last loss value.
@@ -1717,7 +2640,13 @@ def ttt_update_inplace(
     built once per outer step and persists across the video's whole chunk sequence.
     Passing ``None`` builds a throwaway one, which resets that state every call -- exact
     only for stateless SGD; a caller generating multi-chunk video should own one per video
-    (see ``WanE2ETTTSequentialGenerator.generate``)."""
+    (see ``WanE2ETTTSequentialGenerator.generate``).
+
+    ``memorize_condition`` must be whatever meta-training passed as ``memorize_condition`` to
+    ``run_meta_inner_loop`` -- on the i2v route, the NULL conditioning (zero mask, zero latents),
+    which a ``require_vae_embedding`` DiT needs in order to forward at all while leaving the
+    objective unconditioned in content. A mismatch here is silent and makes the test-time update
+    a different rule from the meta-trained one."""
     if updater is None:
         updater = TestTimeInnerOptimizer(pipe.dit, inner_cfg)
     last = 0.0
@@ -1727,10 +2656,12 @@ def ttt_update_inplace(
                 pipe, scheduler, x0, context, inner_cfg,
                 params_override=None,
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                y=(memorize_condition or {}).get("y"),
+                clip_feature=(memorize_condition or {}).get("clip_feature"),
             )
             grads = torch.autograd.grad(loss, updater.params, allow_unused=True)
-        updater.apply(grads)
         last = float(loss.detach().item())
+        updater.apply(grads, diag=diag, loss=last)
     return last
 
 
@@ -1818,6 +2749,7 @@ class WanE2ETTTSequentialGenerator:
         *,
         phi0: Optional[Dict[str, torch.Tensor]] = None,
         use_gradient_checkpointing: bool = False,
+        diagnostics: Optional[TTTDiagnostics] = None,
     ):
         # Off by default here; the Wan2.2-TI2V-5B drivers pass True (their
         # --no_gradient_checkpointing turns it off). At test time the memorize step runs
@@ -1832,6 +2764,9 @@ class WanE2ETTTSequentialGenerator:
         self.inner_cfg = inner_cfg
         self.infer_cfg = infer_cfg
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        # Optional per-step instrumentation of the inner loop; None costs one `is not None`
+        # check per optimizer step and nothing else.
+        self.diagnostics = diagnostics
         self.scheduler = make_training_scheduler(infer_cfg.sigma_shift)
         self.phi0 = phi0 if phi0 is not None else snapshot_lora_state(pipe.dit)
         # Echo the update rule phi_0 is about to be adapted with: it must match the
@@ -1844,7 +2779,15 @@ class WanE2ETTTSequentialGenerator:
         # The anchoring route must match the one phi_0 was meta-trained under; the two put the
         # anchor latents in different places, so a mismatch conditions on tokens the
         # checkpoint never saw.
-        if getattr(infer_cfg, "attention_anchor", False):
+        if getattr(infer_cfg, "i2v_anchor", False):
+            m = max(1, int(getattr(infer_cfg, "num_motion_frames", 1)))
+            pad = int(getattr(infer_cfg, "ref_pad_num", 0))
+            print(f"{self._log_prefix} anchoring: pretrained i2v (y + CLIP) | "
+                  f"motion window {m} pixel frames -> {motion_latent_frames(m)} latent frames | "
+                  f"ref_pad_num={pad} "
+                  f"({'zeros' if pad == 0 else ('reference frame everywhere' if pad < 0 else f'reference frame x{pad}')}) | "
+                  f"mask left at the pretrained [1,0,0,...] pattern")
+        elif getattr(infer_cfg, "attention_anchor", False):
             print(f"{self._log_prefix} anchoring: attention prefix "
                   f"(k={infer_cfg.num_anchor_latent_frames} latents"
                   f"{' + sink' if infer_cfg.condition_on_first_frame_sink else ''}, "
@@ -1896,6 +2839,11 @@ class WanE2ETTTSequentialGenerator:
         # make_inner_optimizer is called once per outer step; and reset per video, matching
         # the per-video phi_0 reset in run_meta_inner_loop.
         updater = TestTimeInnerOptimizer(self.pipe.dit, self.inner_cfg)
+        # Attach here, not in __init__: the drift baseline must be phi_0 as of THIS
+        # narrative, and `updater.master` is exactly that right after the restore above.
+        diag = self.diagnostics
+        if diag is not None:
+            diag.attach(updater, self.inner_cfg, video=str(prompt)[:80])
 
         all_frames = []
         # Width of the local anchor block, in latent frames (k), and the number of decoded
@@ -1907,6 +2855,19 @@ class WanE2ETTTSequentialGenerator:
         # re-encode, boundary trimming -- falls away: the latents are handed forward directly
         # from the sampler, and every generated frame is new content.
         attn_anchor = bool(getattr(icfg, "attention_anchor", False))
+        # i2v anchor (Wan2.1-Fun-*-InP / Wan2.1-I2V-*): condition through the DiT's own pretrained
+        # `y` + CLIP path, SVI-style. `m` is a PIXEL-frame window handed forward from the previous
+        # chunk; `ref_pad_num` decides whether the rest of `y` is zeros or the fixed reference
+        # frame. Chunk 0 needs no special case -- it passes the start image repeated m times,
+        # which is a regime meta-training also samples (SVI's `p_motion_threshold`).
+        i2v_anchor = bool(getattr(icfg, "i2v_anchor", False))
+        num_motion = max(1, int(getattr(icfg, "num_motion_frames", 1)))
+        ref_pad_num = int(getattr(icfg, "ref_pad_num", 0))
+        motion_frames = None
+        # Null conditioning for the memorize step: "no frames are given". Built once per video --
+        # it depends only on the chunk geometry -- and must match what meta-training passed as
+        # `memorize_condition`, or the test-time update is a different rule from the trained one.
+        memorize_condition = None
         prev_latents = None
         sink_latent = None
         sink_wanted = bool(icfg.condition_on_first_frame_sink) and (
@@ -1922,9 +2883,13 @@ class WanE2ETTTSequentialGenerator:
         cond_image = input_image
         cond_frames = None
         # Fixed global anchor ("first-frame sink"): the video's actual first raw frame,
-        # captured once after chunk 0 and reused unchanged for every later chunk.
-        sink_image = None
+        # captured once after chunk 0 and reused unchanged for every later chunk. On the i2v
+        # route it is SVI's reference image, so when the caller supplied one it is known upfront
+        # and chunk 0 gets it too (SVI passes `random_ref_frame` to every chunk).
+        sink_image = input_image if (i2v_anchor and input_image is not None) else None
         for k in range(icfg.num_chunks):
+            if diag is not None:
+                diag.begin_chunk(k)
             call_kwargs = dict(
                 prompt=prompts[k],
                 negative_prompt=negative_prompt,
@@ -1944,21 +2909,31 @@ class WanE2ETTTSequentialGenerator:
                 call_kwargs["anchor_latents"] = attention_anchor_latents(
                     prev_latents, k_anchor, sink_latent
                 )
+            # i2v anchor: hand the previous chunk's trailing `num_motion` frames to the DiT's
+            # pretrained conditioning path. On chunk 0 `motion_frames` is the seed image repeated.
+            if i2v_anchor:
+                if motion_frames is None and cond_image is not None:
+                    motion_frames = [cond_image] * num_motion
+                if motion_frames is not None and (k == 0 or icfg.condition_on_last_frame):
+                    call_kwargs["anchor_frames"] = motion_frames
+                    call_kwargs["ref_pad_num"] = ref_pad_num
+                    if sink_image is not None:
+                        call_kwargs["sink_image"] = sink_image
             # Image-condition this chunk (TI2V-5B fused first-frame latent):
             #   - k == 0: the optional I2V seed image, if any;
             #   - k  > 0: the last frame of the previous chunk, when enabled.
-            if not attn_anchor and cond_image is not None and (k == 0 or icfg.condition_on_last_frame):
+            if not attn_anchor and not i2v_anchor and cond_image is not None and (k == 0 or icfg.condition_on_last_frame):
                 call_kwargs["input_image"] = cond_image
             # k>1: hand the whole trailing window forward. `anchor_frames` supersedes
             # `input_image` inside the fused embedder, which encodes it as one clip. Only for
             # follow-up chunks -- chunk 0 has no preceding chunk, so it stays a plain
             # (optionally I2V-seeded) generation.
-            if not attn_anchor and k > 0 and icfg.condition_on_last_frame and k_anchor > 1 and cond_frames is not None:
+            if not attn_anchor and not i2v_anchor and k > 0 and icfg.condition_on_last_frame and k_anchor > 1 and cond_frames is not None:
                 call_kwargs["anchor_frames"] = cond_frames
             # Sink-condition follow-up chunks on the video's very first frame, alongside
             # the sliding local anchor above.
             sink_active = (
-                not attn_anchor and k > 0 and icfg.condition_on_first_frame_sink
+                not attn_anchor and not i2v_anchor and k > 0 and icfg.condition_on_first_frame_sink
                 and icfg.condition_on_last_frame and sink_image is not None
             )
             if sink_active:
@@ -1975,7 +2950,14 @@ class WanE2ETTTSequentialGenerator:
             # than new content; drop them to avoid a duplicate-frame seam at the boundary.
             # Nothing to trim under the attention anchor: the prefix occupies its own
             # sequence positions, so every decoded frame of this chunk is new content.
-            if not attn_anchor and k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
+            if i2v_anchor:
+                # The chunk's leading `num_motion` decoded frames regenerate the motion window it
+                # was conditioned on, so they duplicate the previous chunk's tail. (SVI instead
+                # trims the *tail* of the previous chunk; same count either way, but trimming the
+                # head keeps the original frames rather than a regeneration of them.)
+                trim = num_motion if (k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame) else 0
+                emitted = frames[trim:]
+            elif not attn_anchor and k > 0 and icfg.condition_on_last_frame and icfg.drop_boundary_frame:
                 emitted = frames[num_pinned_pixel_frames(num_clean_latents(k_anchor, sink_active)):]
             else:
                 emitted = frames
@@ -1993,6 +2975,19 @@ class WanE2ETTTSequentialGenerator:
                     )
                 if k == 0 and sink_wanted:
                     sink_latent = prev_latents[:, :, 0:1].clone()
+            # i2v anchor: hand the trailing motion window forward, and build the per-video null
+            # memorize conditioning once the chunk geometry is known.
+            if i2v_anchor and len(frames) > 0:
+                if len(frames) < num_motion:
+                    raise ValueError(
+                        f"chunk {k} produced {len(frames)} frames but the motion window needs "
+                        f"{num_motion}; raise frames_per_chunk or lower num_motion_frames."
+                    )
+                motion_frames = frames[-num_motion:]
+                if memorize_condition is None:
+                    memorize_condition = build_i2v_conditioning(
+                        self.pipe, [], icfg.frames_per_chunk, icfg.height, icfg.width,
+                    )
             # Carry the anchor forward. `anchor_window` frames for the k>1 block path (a
             # contiguous tail, re-encoded as one clip next iteration), the single last frame
             # for the legacy k=1 path.
@@ -2015,7 +3010,8 @@ class WanE2ETTTSequentialGenerator:
                   f"({len(emitted)} frames)"
                   + (f" | prompt: {prompts[k][:40]}..." if varying_prompts else ""))
 
-            if k == icfg.num_chunks - 1:
+            is_last = k == icfg.num_chunks - 1
+            if is_last and diag is None:
                 continue
 
             # Memorize the chunk we just generated -- straight from the sampler's final
@@ -2026,11 +3022,29 @@ class WanE2ETTTSequentialGenerator:
             # to `prompt` unless a subclass supplies a varying schedule.
             context = self._encode_prompt(prompts[k])
             self.pipe.load_models_to_device(["dit"])
+            # Probe BEFORE this chunk's memorize step, so `probe_self` reads as "does the
+            # scratchpad adapted on chunks 0..k-1 already explain chunk k" -- the
+            # generalization the meta-objective is supposed to buy -- rather than fit
+            # quality. The last chunk is never memorized but is the most drifted, so it is
+            # measured too; that is the only reason the guard above is diag-dependent
+            # rather than an unconditional `continue`.
+            if diag is not None:
+                diag.record_chunk(
+                    self.pipe, self.scheduler, self.inner_cfg,
+                    x0=x0, context=context,
+                    memorize_condition=memorize_condition,
+                    use_gradient_checkpointing=self.use_gradient_checkpointing,
+                    when="pre_update",
+                )
+            if is_last:
+                continue
             for step in range(max(1, int(icfg.ttt_steps_per_chunk))):
                 loss = ttt_update_inplace(
                     self.pipe, self.scheduler, x0, context, self.inner_cfg,
                     use_gradient_checkpointing=self.use_gradient_checkpointing,
                     updater=updater,
+                    memorize_condition=memorize_condition,
+                    diag=diag,
                 )
                 print(f"{self._log_prefix}  memorize chunk {k + 1} step {step + 1}/"
                       f"{icfg.ttt_steps_per_chunk} loss={loss:.6f}")

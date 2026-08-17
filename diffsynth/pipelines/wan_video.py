@@ -209,6 +209,10 @@ class WanVideoPipeline(BasePipeline):
         # not consume any of the chunk's own latent slots, needs no VAE encode, and works on
         # any plain T2V DiT -- see `model_fn_wan_video`.
         anchor_latents: torch.Tensor = None,
+        # E2E-TTT i2v anchor (SVI's `ref_pad_num`): what fills the non-conditioning pixel slots
+        # of `y`. 0 = zeros (stock I2V), -1 = `sink_image` in every slot, n > 0 = the first n.
+        # Only meaningful on a require_vae_embedding DiT together with `sink_image`.
+        ref_pad_num: int = 0,
         # First-last-frame-to-video
         end_image: Image.Image = None,
         # Video-to-video
@@ -304,6 +308,7 @@ class WanVideoPipeline(BasePipeline):
             "sink_image": sink_image,
             "anchor_frames": anchor_frames,
             "anchor_latents": anchor_latents,
+            "ref_pad_num": ref_pad_num,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
@@ -481,12 +486,18 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
 class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "end_image", "height", "width"),
+            input_params=("input_image", "end_image", "anchor_frames", "height", "width"),
             output_params=("clip_feature",),
             onload_model_names=("image_encoder",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_image, end_image, height, width):
+    def process(self, pipe: WanVideoPipeline, input_image, end_image, anchor_frames, height, width):
+        # E2E-TTT i2v anchor: when a motion-frame window is given, the CLIP descriptor comes from
+        # its FIRST frame -- the frame sitting at pixel position 0 of the conditioning window, so
+        # it means exactly what `input_image` means on the single-image path. This mirrors SVI
+        # (`encode_images_adaptive`: `clip_context = image_encoder.encode_image([first_frames[0]])`).
+        if anchor_frames:
+            input_image = anchor_frames[0]
         if input_image is None or pipe.image_encoder is None or not pipe.dit.require_clip_embedding:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
@@ -502,37 +513,134 @@ class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
 
 
 class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
+    """Build the I2V conditioning tensor ``y`` = [4-channel mask ; 16-channel VAE latents].
+
+    Two extras beyond the stock single-image path, both for E2E-TTT's *i2v anchor* route and
+    both copied from Stable-Video-Infinity (``diffsynth/pipelines/svi_video.py::
+    encode_images_adaptive``), which drives Wan2.1-I2V-14B-480P the same way:
+
+    ``anchor_frames`` -- a window of ``m`` motion frames (the preceding chunk's tail) laid at
+    pixel positions ``0..m-1`` of the VAE input instead of a single frame.
+
+    ``ref_pad_num`` -- what fills the REMAINING pixel positions: ``0`` (or no ``sink_image``)
+    keeps the stock zeros; ``-1`` fills every one of them with ``sink_image``; ``n > 0`` fills
+    the first ``n``. SVI calls this "padding for ID consistency" and its shipped configurations
+    use ``-1`` everywhere except SVI-Film.
+
+    The critical detail is what does NOT change: **the mask stays exactly ``[1, 0, 0, ...]``**,
+    marking only pixel frame 0 as given, precisely as in I2V pretraining. SVI has a
+    ``ref_pad_cfg`` switch that would widen it to ``msk[:, m:] = 0`` and *no shipped script
+    turns it on* (``gradio_demo.py`` passes it explicitly False). So every motion frame past the
+    first, and the whole reference padding, is delivered as image-latent CONTENT in regions the
+    mask calls "not given" -- context the model may use, not frames it is told to reproduce.
+    That is what keeps the conditioning channel in-distribution while carrying far more than one
+    frame of information, and it is why this route needs no mask arithmetic at all.
+
+    Note on dtype: SVI casts the VAE to fp32 for this encode; we keep the pipeline dtype. What
+    E2E-TTT actually requires is that meta-training and sampling build ``y`` identically, and
+    both go through this unit, so they do. Untiled is not optional though -- see below.
+    """
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "end_image", "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"),
+            input_params=("input_image", "end_image", "anchor_frames", "sink_image", "ref_pad_num",
+                          "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"),
             output_params=("y",),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_image, end_image, num_frames, height, width, tiled, tile_size, tile_stride):
-        if input_image is None or not pipe.dit.require_vae_embedding:
+    def process(self, pipe: WanVideoPipeline, input_image, end_image, anchor_frames, sink_image, ref_pad_num,
+                num_frames, height, width, tiled, tile_size, tile_stride):
+        if not pipe.dit.require_vae_embedding:
             return {}
+        if input_image is None and not anchor_frames:
+            # An IMAGE-CONDITIONED DiT has no valid forward without `y` (its patch_embedding
+            # expects 16 + 20 channels), so returning nothing here used to raise deep inside the
+            # DiT. Emit the encoding of "no frames are given" instead -- an all-zero mask over an
+            # all-zero clip -- which is the literal meaning of this parameterisation and the mode
+            # a Fun-InP text-to-video call needs. NOTE it once: it is the model's condition-drop
+            # regime, which these checkpoints are trained for but which we have not measured.
+            #
+            # `has_image_input` is the necessary half of this test: `require_vae_embedding`
+            # DEFAULTS to True on WanModel, so plain T2V DiTs (Wan2.1-T2V-1.3B/14B, in_dim=16)
+            # also carry it. Emitting a `y` for those would make model_fn concatenate 20 extra
+            # channels into a 16-channel patch_embedding.
+            if not getattr(pipe.dit, "has_image_input", False):
+                return {}
+            if not getattr(pipe, "_warned_null_image_conditioning", False):
+                print("[DiffSynth] NOTE: no input_image/anchor_frames on a DiT that requires VAE "
+                      "image conditioning; encoding null conditioning (zero mask, zero latents).")
+                pipe._warned_null_image_conditioning = True
+            pipe.load_models_to_device(self.onload_model_names)
+            msk = torch.zeros(1, num_frames, height//8, width//8, device=pipe.device)
+            vae_input = torch.zeros(3, num_frames, height, width, device=pipe.device)
+            return {"y": self._pack(pipe, msk, vae_input, height, width, tiled=False,
+                                    tile_size=tile_size, tile_stride=tile_stride)}
+        if anchor_frames and end_image is not None:
+            raise ValueError("anchor_frames (E2E-TTT motion window) and end_image cannot be combined.")
         pipe.load_models_to_device(self.onload_model_names)
-        image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
         msk = torch.ones(1, num_frames, height//8, width//8, device=pipe.device)
         msk[:, 1:] = 0
-        if end_image is not None:
+
+        if anchor_frames:
+            m = len(anchor_frames)
+            if m > num_frames:
+                raise ValueError(
+                    f"anchor_frames has {m} frames but the chunk is only {num_frames} frames long."
+                )
+            cond = pipe.preprocess_video(
+                [f.resize((width, height)) for f in anchor_frames], device=pipe.device
+            )[0]  # [C, m, H, W]
+            vae_input = torch.concat([cond, self._padding(pipe, sink_image, ref_pad_num,
+                                                          num_frames - m, height, width)], dim=1)
+        elif end_image is not None:
+            image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
             end_image = pipe.preprocess_image(end_image.resize((width, height))).to(pipe.device)
             vae_input = torch.concat([image.transpose(0,1), torch.zeros(3, num_frames-2, height, width).to(image.device), end_image.transpose(0,1)],dim=1)
             msk[:, -1:] = 1
         else:
-            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
+            image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
+            vae_input = torch.concat([image.transpose(0, 1), self._padding(pipe, sink_image, ref_pad_num,
+                                                                          num_frames - 1, height, width)], dim=1)
 
+        # The anchor window MUST be encoded untiled: E2E-TTT meta-training encodes chunks with
+        # `tiled=False`, and tiled encoding alpha-blends overlapping spatial tiles rather than
+        # reproducing the whole-frame encode. This bites at 480x832 on the Wan2.1 VAE -- 60x104
+        # latents against the default tile_size=(30, 52) is a genuine 2x2 split, not the single
+        # tile the 16x Wan2.2 VAE happens to give. The plain single-image path keeps the caller's
+        # `tiled` so existing I2V/FLF2V behaviour is byte-identical.
+        return {"y": self._pack(pipe, msk, vae_input, height, width,
+                                tiled=False if anchor_frames else tiled,
+                                tile_size=tile_size, tile_stride=tile_stride)}
+
+    @staticmethod
+    def _padding(pipe, sink_image, ref_pad_num, remaining, height, width):
+        """Fill the non-conditioning pixel positions (SVI's ``ref_pad_num``)."""
+        zeros = lambda n: torch.zeros(3, n, height, width, dtype=pipe.torch_dtype, device=pipe.device)
+        if remaining <= 0:
+            return zeros(0)
+        n = 0 if ref_pad_num is None else int(ref_pad_num)
+        if sink_image is None or n == 0:
+            return zeros(remaining)
+        ref = pipe.preprocess_image(sink_image.resize((width, height))).to(pipe.device).transpose(0, 1)
+        count = remaining if n < 0 else min(n, remaining)
+        return torch.concat([ref.repeat(1, count, 1, 1), zeros(remaining - count)], dim=1)
+
+    @staticmethod
+    def _pack(pipe, msk, vae_input, height, width, *, tiled, tile_size, tile_stride):
+        """Pack the pixel-space mask into 4 channels per latent frame and prepend it to the latents.
+
+        Pixel frame 0 is replicated 4x so the mask length becomes 4*T', giving latent frame 0 the
+        four slots of pixel frame 0 and every later latent frame `t` the slots of pixel frames
+        ``4(t-1)+1 .. 4t`` -- the same grouping the causal VAE uses.
+        """
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
-        y = torch.concat([msk, y])
+        y = torch.concat([msk.to(dtype=y.dtype, device=y.device), y])
         y = y.unsqueeze(0)
-        y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
-        return {"y": y}
+        return y.to(dtype=pipe.torch_dtype, device=pipe.device)
 
 
 
@@ -1551,6 +1659,22 @@ def model_fn_wan_video(
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
         x = torch.cat([x, y], dim=1)
+    if clip_feature is None and dit.require_clip_embedding and getattr(dit, "has_image_input", False):
+        # A `has_image_input` DiT does NOT merely "run without image tokens" when the CLIP prefix
+        # is skipped. Every block's `CrossAttention.forward` splits `context[:, :257]` off as the
+        # image tokens (wan_video_dit.py:187) -- that slice is baked in at construction, not
+        # conditional on what is passed here. So an unprefixed context sends the first 257 TEXT
+        # tokens through k_img/v_img and leaves the text branch with `context[:, 257:]`, which
+        # umt5 zero-pads for any prompt shorter than 257 tokens: the prompt is dropped entirely
+        # and the output is promptless texture. Emit the null CLIP descriptor instead -- the same
+        # condition-drop encoding `WanVideoUnit_FunControl` already uses -- so the prefix is
+        # always present and only its content says "no image". This is the regime E2E-TTT's i2v
+        # route hits on chunk 0 (no preceding chunk, no `--input_image`) and on every memorize
+        # step, where the conditioning is null by construction.
+        # FLF2V's `img_emb` adds a learned 514-token positional embedding, so size the null
+        # descriptor to whatever that MLP expects rather than hardcoding one image's 257.
+        n_clip_tokens = dit.img_emb.emb_pos.shape[1] if getattr(dit.img_emb, "has_pos_emb", False) else 257
+        clip_feature = torch.zeros((context.shape[0], n_clip_tokens, 1280), dtype=x.dtype, device=x.device)
     if clip_feature is not None and dit.require_clip_embedding:
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)

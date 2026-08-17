@@ -15,7 +15,7 @@ unmodified ``launch_training_task`` loop is correct with no W0-restore hook need
 Targets: Wan2.1-T2V-1.3B and Wan2.2-TI2V-5B (single-DiT Wan pipelines).
 """
 
-import torch, os, json, argparse, accelerate, datetime, resource
+import torch, os, json, argparse, accelerate, datetime, random, resource
 try:
     import psutil
 except ImportError:
@@ -27,6 +27,7 @@ from diffsynth.diffusion.e2e_ttt import (
     InnerLoopConfig, ChunkingConfig, make_training_scheduler, run_meta_inner_loop,
     count_lora_params, enable_double_backward_attention, get_lora_params,
     ErrorRecycler, anchor_overlap_pixel_frames, num_clean_latents,
+    build_i2v_conditioning, motion_latent_frames,
 )
 
 # Reuse the vanilla module so all the model-loading / LoRA-injection plumbing is shared.
@@ -156,15 +157,19 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         e2e_condition_on_last_frame=True,
         e2e_condition_on_sink_frame=True,
         e2e_num_anchor_latent_frames=1,
-        e2e_attention_anchor=False,
+        e2e_num_motion_frames=5,
+        e2e_ref_pad_num=-1,
+        e2e_ref_frame_source="first",
+        e2e_p_motion_threshold=0.9,
         e2e_use_error_recycling=False,
+        e2e_shared_buffer_dir=None,
         e2e_num_grids=50,
         e2e_error_buffer_k=32,
         e2e_buffer_warmup_iter=20,
-        e2e_noise_prob=0.9,
+        e2e_noise_prob=0.01,
         e2e_latent_prob=0.9,
         e2e_y_prob=0.9,
-        e2e_clean_prob=0.1,
+        e2e_clean_prob=0.5,
         e2e_error_modulate_factor=0.0,
         e2e_anchor_sample_from_all_grids=True,
         outer_lr=None,
@@ -225,17 +230,48 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         # supports it (fuse_vae_embedding_in_latents); requesting it on e.g. Wan2.1-T2V is a
         # no-op. When effective, chunks are sliced with a 1-frame overlap so each predict
         # chunk's first frame is the previous chunk's last frame (the inference anchor).
+        #
+        # Route selection. Two mechanisms can carry the anchor, and which one a checkpoint
+        # supports is a property of its DiT:
+        #   * "fused"  - TI2V-5B's fused clean latents (fuse_vae_embedding_in_latents);
+        #   * "i2v"    - the pretrained I2V conditioning of a require_vae_embedding DiT
+        #                (Wan2.1-Fun-*-InP, Wan2.1-I2V-*), i.e. `y` + CLIP, the route
+        #                Stable-Video-Infinity uses;
+        #   * "none"   - no anchoring mechanism (plain T2V); scratchpad only.
+        # phi_0 checkpoints are NOT interchangeable across routes.
         _supports_fused = bool(getattr(self.pipe.dit, "fuse_vae_embedding_in_latents", False))
-        self.condition_on_last_frame = bool(e2e_condition_on_last_frame) and _supports_fused
-        if bool(e2e_condition_on_last_frame) and not _supports_fused:
-            print("[E2E-TTT] NOTE: this DiT has no fused first-frame conditioning "
-                  "(fuse_vae_embedding_in_latents); training without last-frame conditioning "
-                  "(contiguous, non-overlapping chunks). This is expected for Wan2.1-T2V.")
+        _supports_i2v = bool(getattr(self.pipe.dit, "has_image_input", False)) and \
+            bool(getattr(self.pipe.dit, "require_vae_embedding", False))
+        self.anchor_route = "fused" if _supports_fused else ("i2v" if _supports_i2v else "none")
+        if (self.anchor_route == "i2v"
+                and bool(getattr(self.pipe.dit, "require_clip_embedding", False))
+                and getattr(self.pipe, "image_encoder", None) is None):
+            # Fail loudly. WanVideoUnit_ImageEmbedderCLIP returns {} when there is no image
+            # encoder, and model_fn only prepends image tokens `if clip_feature is not None`,
+            # so a missing CLIP checkpoint does not raise -- it silently trains every chunk
+            # with a text-only cross-attention context this checkpoint was never trained on.
+            raise ValueError(
+                "this DiT requires CLIP image conditioning (require_clip_embedding) but no "
+                "image encoder was loaded. Add the CLIP weights to `model_paths`, e.g. "
+                "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth from the checkpoint "
+                "directory. Without it the i2v anchor route trains with no image tokens at all."
+            )
+        self.condition_on_last_frame = bool(e2e_condition_on_last_frame) and self.anchor_route != "none"
+        if bool(e2e_condition_on_last_frame) and self.anchor_route == "none":
+            print("[E2E-TTT] NOTE: this DiT has no image-conditioning mechanism "
+                  "(neither fuse_vae_embedding_in_latents nor require_vae_embedding); training "
+                  "without last-frame conditioning (contiguous, non-overlapping chunks). This is "
+                  "expected for Wan2.1-T2V.")
         # First-frame "sink": additionally pin each video's very first chunk's first latent
         # frame alongside the sliding last-frame anchor above. Requires the last-frame anchor
         # to be effective too (there is no local anchor to pair the sink with otherwise).
-        self.condition_on_sink_frame = bool(e2e_condition_on_sink_frame) and self.condition_on_last_frame
-        if bool(e2e_condition_on_sink_frame) and not self.condition_on_last_frame:
+        # (On the i2v route the sink is not a pinned latent but `ref_pad_num` -- see below --
+        # so this fused-only switch stays off there.)
+        self.condition_on_sink_frame = (
+            bool(e2e_condition_on_sink_frame) and self.condition_on_last_frame
+            and self.anchor_route == "fused"
+        )
+        if bool(e2e_condition_on_sink_frame) and not self.condition_on_sink_frame and self.anchor_route != "i2v":
             print("[E2E-TTT] NOTE: --e2e_condition_on_sink_frame requires "
                   "--e2e_condition_on_last_frame (and fused first-frame conditioning support); "
                   "training without the first-frame sink.")
@@ -247,17 +283,38 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             print("[E2E-TTT] NOTE: --e2e_num_anchor_latent_frames > 1 requires "
                   "--e2e_condition_on_last_frame; training with a single anchor frame.")
             self.num_anchor_latent_frames = 1
-        # Pixel frames of the preceding chunk the anchor block consumes == the chunk overlap.
-        self.anchor_overlap = (
-            anchor_overlap_pixel_frames(self.num_anchor_latent_frames, self.condition_on_sink_frame)
-            if self.condition_on_last_frame else 0
-        )
-        # SVI-style recycled-error buffers for anti-drift (arXiv:2510.09212). Per-process
-        # only (no all_gather); the warmup iterations are collection-only, then recycled
-        # errors are injected into the memorize inputs and the predict anchor frame.
+        # --- i2v route knobs (SVI's --num_motion_frames / --ref_pad_num / --p_motion_threshold).
+        # `num_motion_frames` is a PIXEL-frame window, unlike the fused route's latent-frame k:
+        # m=1 reproduces stock single-frame I2V, m=5 gives real content to two latent frames.
+        self.num_motion_frames = max(1, int(e2e_num_motion_frames))
+        self.ref_pad_num = int(e2e_ref_pad_num)
+        # Which frame of the clip fills `y`'s reference padding. See the CLI help; `first`
+        # is the train/test-aligned choice and the default, `random` reproduces SVI.
+        self.ref_frame_source = str(e2e_ref_frame_source).lower()
+        if self.ref_frame_source not in ("first", "random"):
+            raise ValueError(
+                f"--e2e_ref_frame_source must be 'first' or 'random', got {e2e_ref_frame_source!r}."
+            )
+        self.p_motion_threshold = float(e2e_p_motion_threshold)
+        # Pixel frames of the preceding chunk the anchor consumes == the chunk overlap. On the
+        # i2v route that is simply the motion window; the fused route has to account for the
+        # sink's latent displacement and its VAE causal-context frame.
+        if not self.condition_on_last_frame:
+            self.anchor_overlap = 0
+        elif self.anchor_route == "i2v":
+            self.anchor_overlap = self.num_motion_frames
+        else:
+            self.anchor_overlap = anchor_overlap_pixel_frames(
+                self.num_anchor_latent_frames, self.condition_on_sink_frame
+            )
+        # SVI-style recycled-error buffers for anti-drift (arXiv:2510.09212). Per-process by
+        # default (no all_gather), or one arena per NODE with --e2e_shared_buffer_dir; the
+        # warmup iterations are collection-only, then recycled errors are injected into the
+        # memorize inputs and the predict anchor frame.
         self.error_recycler = None
         if e2e_use_error_recycling:
             self.error_recycler = ErrorRecycler(
+                shared_buffer_dir=e2e_shared_buffer_dir or None,
                 num_grids=int(e2e_num_grids),
                 error_buffer_k=int(e2e_error_buffer_k),
                 buffer_warmup_iter=int(e2e_buffer_warmup_iter),
@@ -275,14 +332,31 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
                   f"modulate={e2e_error_modulate_factor}")
         _chunks_desc = ("adaptive" if self.chunk_cfg.num_chunks is None
                         else f"<={self.chunk_cfg.num_chunks}")
+        _T = (self.chunk_cfg.frames_per_chunk - 1) // 4 + 1
+        if self.anchor_route == "i2v":
+            _anchor_desc = (
+                f"route=i2v (pretrained y + CLIP) | "
+                f"motion window {self.num_motion_frames}f -> "
+                f"{motion_latent_frames(self.num_motion_frames)}/{_T} latents carry content | "
+                f"ref_pad_num={self.ref_pad_num}"
+                + (f" (ref={self.ref_frame_source} frame)" if self.ref_pad_num != 0 else "")
+                + f" | p_motion={self.p_motion_threshold} "
+                f"(overlap={self.anchor_overlap}f, mask left at the pretrained pattern, "
+                f"all {_T} latents supervised)"
+            )
+        else:
+            _anchor_desc = (
+                f"route={self.anchor_route} | "
+                f"condition_on_sink_frame={self.condition_on_sink_frame} | "
+                f"anchor_latents={self.num_anchor_latent_frames} "
+                f"(overlap={self.anchor_overlap}f, "
+                f"{num_clean_latents(self.num_anchor_latent_frames, self.condition_on_sink_frame)}"
+                f"/{_T} latents pinned)"
+            )
         print(f"[E2E-TTT] meta-training | LoRA params: {count_lora_params(self.pipe.dit):,} | "
               f"chunks={_chunks_desc} x {self.chunk_cfg.frames_per_chunk}f | "
               f"condition_on_last_frame={self.condition_on_last_frame} | "
-              f"condition_on_sink_frame={self.condition_on_sink_frame} | "
-              f"anchor_latents={self.num_anchor_latent_frames} "
-              f"(overlap={self.anchor_overlap}f, "
-              f"{num_clean_latents(self.num_anchor_latent_frames, self.condition_on_sink_frame)}"
-              f"/{(self.chunk_cfg.frames_per_chunk - 1) // 4 + 1} latents pinned) | "
+              f"{_anchor_desc} | "
               f"outer_lr={self.outer_lr} | "
               f"algorithm={self.inner_cfg.algorithm} | "
               f"inner={self.inner_cfg.optimizer} lr={self.inner_cfg.inner_lr_init} "
@@ -322,7 +396,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             _need = fpc + stride  # frames for 2 chunks at this stride
             print(f"[E2E-TTT] skipping clip with {len(frames)} frames: needs >= 2 chunks "
                   f"of {fpc} frames at stride {stride} (>= {_need}).")
-            return [], None
+            return [], None, None, None
 
         # NOTE: pipe.load_models_to_device() is a no-op in the training path —
         # VRAM management is only wired up for inference (base_pipeline guards it
@@ -335,11 +409,54 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         # VRAM during the create_graph inner-loop grad.
         pipe.vae.to(device)
         chunk_latents = []
+        subs = []
         for k in range(n):
             sub = frames[k * stride:k * stride + fpc]
+            subs.append(sub)
             video = pipe.preprocess_video(sub)  # [1, C, T, H, W]
             z = pipe.vae.encode([video[0]], device=device, tiled=False)
             chunk_latents.append(z.to(dtype=dtype, device=device).detach())
+
+        # --- i2v route: build (y, clip_feature) once per chunk, while the VAE and the image
+        # encoder are already resident. They depend only on pixels -- never on the timestep or
+        # the LoRA state -- so building them here keeps both towers off the meta-graph, the same
+        # reason latents and context are encoded here rather than inside the inner loop.
+        conditions, memorize_condition = None, None
+        if self.anchor_route == "i2v":
+            m = self.num_motion_frames
+            if pipe.image_encoder is not None:
+                pipe.image_encoder.to(device)
+            h, w = frames[0].size[1], frames[0].size[0]
+            # The reference frame SVI pads `y` with, fixed for the whole clip (one reference
+            # serves every chunk, as at inference). `first` matches what the generator actually
+            # hands the model at test time -- see --e2e_ref_frame_source.
+            if self.ref_pad_num == 0:
+                ref_frame = None
+            elif self.ref_frame_source == "random":
+                ref_frame = frames[random.randrange(len(frames))]
+            else:
+                ref_frame = frames[0]
+            conditions = [None] * n
+            for k in range(1, n):
+                # Predicting chunk k is conditioned on the m pixel frames preceding it, which
+                # overlap chunking has made chunk k's OWN leading m frames -- byte-identical to
+                # the window inference hands forward from chunk k-1.
+                window = subs[k][:m]
+                # SVI's p_motion_threshold: some of the time, condition on the first frame
+                # repeated instead of a real motion window. That is exactly the regime chunk 0
+                # is in at inference (a still start image), so training both through one path
+                # is what lets inference use one path too.
+                if m > 1 and random.random() >= self.p_motion_threshold:
+                    window = [subs[k][0]] * m
+                conditions[k] = build_i2v_conditioning(
+                    pipe, window, fpc, h, w, ref_frame=ref_frame, ref_pad_num=self.ref_pad_num,
+                )
+            # The memorize objective stays unconditioned in content, but this DiT cannot forward
+            # without a `y`; pass the null encoding ("no frames given"). Test time must use the
+            # same tensor -- see WanE2ETTTSequentialGenerator.generate.
+            memorize_condition = build_i2v_conditioning(pipe, [], fpc, h, w)
+            if pipe.image_encoder is not None:
+                pipe.image_encoder.to("cpu")
         pipe.vae.to("cpu")
 
         pipe.text_encoder.to(device)
@@ -347,7 +464,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         context = context.to(dtype=dtype, device=device).detach()
         pipe.text_encoder.to("cpu")
         torch.cuda.empty_cache()
-        return chunk_latents, context
+        return chunk_latents, context, conditions, memorize_condition
 
     @torch.no_grad()
     def _lora_dynamics_metrics(self):
@@ -428,7 +545,7 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
         return zero
 
     def forward(self, data, inputs=None):
-        chunk_latents, context = self._encode_chunks(data)
+        chunk_latents, context, conditions, memorize_condition = self._encode_chunks(data)
         if len(chunk_latents) < 2:
             return self._zero_loss_skip()
         self.pipe.load_models_to_device(["dit"])
@@ -442,9 +559,14 @@ class WanE2ETTTTrainingModule(WanTrainingModule):
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             write_back=False,
             algorithm=self.inner_cfg.algorithm,
-            condition_on_first_frame=self.condition_on_last_frame,
+            # The fused route's flags; on the i2v route the anchor rides in `video_conditions`
+            # instead, so these stay off and the two can never both be active.
+            condition_on_first_frame=self.condition_on_last_frame and self.anchor_route == "fused",
             condition_on_first_frame_sink=self.condition_on_sink_frame,
             num_anchor_latent_frames=self.num_anchor_latent_frames,
+            video_conditions=[conditions] if conditions is not None else None,
+            memorize_condition=memorize_condition,
+            num_motion_latent_frames=motion_latent_frames(self.num_motion_frames),
             error_recycler=self.error_recycler,
         )
         # Surface inner-loop diagnostics so ModelLogger picks them up on the main process.
@@ -580,6 +702,43 @@ def e2e_ttt_parser():
                         "11 latents, so raise --e2e_frames_per_chunk (49 restores today's 9 "
                         "supervised latents) rather than accepting the weaker meta signal. "
                         "Requires --e2e_condition_on_last_frame.")
+    g.add_argument("--e2e_num_motion_frames", type=int, default=5,
+                   help="i2v route only (Wan2.1-Fun-*-InP, Wan2.1-I2V-*): width of the motion "
+                        "window in PIXEL frames, taken from the preceding chunk (SVI's "
+                        "--num_motion_frames). Note the unit: unlike "
+                        "--e2e_num_anchor_latent_frames this counts pixel frames, and the causal "
+                        "VAE turns m into (m-1)//4+1 latent frames of real content -- 1 -> 1, "
+                        "5 -> 2, 9 -> 3. SVI-Shot/Talk/Dance use 1, SVI-Film and SVI 2.0 use 5. "
+                        "Also the chunk overlap, so at m=5 each chunk contributes "
+                        "frames_per_chunk - 5 new frames.")
+    g.add_argument("--e2e_ref_pad_num", type=int, default=-1,
+                   help="i2v route only (SVI's --ref_pad_num): what fills the non-motion pixel "
+                        "slots of `y`. 0 = zeros (stock I2V); -1 = the reference frame in EVERY "
+                        "remaining slot, SVI's 'padding for ID consistency'; n > 0 = the first n. "
+                        "Which frame is used as the reference is --e2e_ref_frame_source. "
+                        "SVI-Film uses 0, SVI-Shot/Talk/Dance and SVI 2.0 use -1.")
+    g.add_argument("--e2e_ref_frame_source", type=str, default="first", choices=["first", "random"],
+                   help="i2v route only: which frame of the clip fills `y`'s reference padding "
+                        "(inert at --e2e_ref_pad_num 0). `first` (default) is the clip's first "
+                        "frame, which is what the generator hands the model at inference: "
+                        "WanE2ETTTSequentialGenerator captures the video's own first frame after "
+                        "chunk 0 and reuses it unchanged for every later chunk (or uses "
+                        "--input_image, which seeds that same frame). `random` draws a uniform "
+                        "frame per clip, reproducing SVI, whose reference is a user-supplied "
+                        "still that need not be a frame of the video at all -- robustness we do "
+                        "not need and which biases training the wrong way: a random frame is on "
+                        "average more contemporaneous with the chunk being predicted than frame 0 "
+                        "is, and is a FUTURE frame about half the time, so phi_0 would be "
+                        "meta-learned under a strictly more informative reference than it gets at "
+                        "test time. The fused route has always used the first frame on both sides "
+                        "(`sink_frame = chunks[0][:, :, 0:1]`); this makes i2v agree. NOTE a phi_0 "
+                        "meta-trained under one setting is not interchangeable with the other.")
+    g.add_argument("--e2e_p_motion_threshold", type=float, default=0.9,
+                   help="i2v route only (SVI's --p_motion_threshold): probability of "
+                        "conditioning on a REAL motion window; otherwise the chunk's first frame "
+                        "repeated m times. The repeated-still case is exactly the regime chunk 0 "
+                        "is in at inference, so mixing it in is what lets one code path serve "
+                        "both. Inert at --e2e_num_motion_frames 1.")
     er = parser.add_argument_group("E2E-TTT error recycling (SVI-style anti-drift)")
     er.add_argument("--e2e_use_error_recycling", type=lambda s: str(s).lower() not in ("0", "false", "no"),
                     default=False,
@@ -593,14 +752,35 @@ def e2e_ttt_parser():
                     help="Max error samples per grid per buffer (SVI: --error_buffer_k, theirs 500). "
                          "CPU RAM = 2 buffers x num_grids x k x chunk-latent size (~2 MB each for "
                          "TI2V-5B 21f 704x1280).")
+    er.add_argument("--e2e_shared_buffer_dir", type=str, default=None,
+                    help="Directory for ONE recycled-error arena per NODE instead of one per "
+                         "rank (default: per-rank). Cuts host RAM by the local world size -- "
+                         "the binding constraint on the 720p arms -- and every rank then draws "
+                         "from every rank's samples, which is closer to SVI (it all_gathers). "
+                         "No collective communication is added: it is a shared mmap, writes are "
+                         "partitioned per rank and reads use a seqlock, so nothing crosses the "
+                         "node boundary and no lock is taken. MUST be NODE-LOCAL storage and "
+                         "must NOT be tmpfs: /dev/shm pages are unreclaimable with ~1 GiB of "
+                         "swap on a 377 GiB node, and a segment leaked by an OOM-kill (SIGKILL, "
+                         "so no cleanup runs) then costs pinned RAM for the next job instead of "
+                         "disk. Falls back to per-rank buffers on any setup failure. Sizing: at "
+                         "720p/fpc=53 one unit of k costs 0.287 GB/node, so today's k=50 drops "
+                         "57.4 -> 14.4 GB and the same 57.4 GB instead buys k=200. See "
+                         "max_shared_k() in e2e_ttt.py.")
     er.add_argument("--e2e_buffer_warmup_iter", type=int, default=20,
                     help="Collection-only outer steps before injection starts (SVI's "
                          "--buffer_warmup_iter, but WITHOUT the all_gather: buffers are strictly "
                          "per-process; E2E-TTT harvests num_mem_steps x num_mc_samples errors per "
                          "step, so local collection fills the grids quickly).")
-    er.add_argument("--e2e_noise_prob", type=float, default=0.9,
+    er.add_argument("--e2e_noise_prob", type=float, default=0.01,
                     help="Predict loss: probability of injecting a recycled noise-direction error "
-                         "into the noise, with a CLEAN target (SVI: --noise_prob).")
+                         "into the noise, with a CLEAN target (SVI: --noise_prob). Near-zero by "
+                         "default: this is the one injection mode that leaks into the TARGET "
+                         "(target = noise_w_error - x0), so it teaches the model to reproduce the "
+                         "recycled error rather than to correct for it. SVI-Film uses 0.01 for the "
+                         "same reason, and Matrix-Game 3.0 (arXiv:2604.08995), which recycles "
+                         "residuals into history and memory latents only, has no noise-injection "
+                         "mode at all.")
     er.add_argument("--e2e_latent_prob", type=float, default=0.9,
                     help="Memorize loss: probability of corrupting the memorized chunk "
                          "CONSISTENTLY (input and target), replicating the test-time TTT update. "
@@ -609,9 +789,11 @@ def e2e_ttt_parser():
     er.add_argument("--e2e_y_prob", type=float, default=0.9,
                     help="Probability of injecting a recycled data-direction error into the "
                          "pinned anchor frame of the predict loss (SVI: --y_prob).")
-    er.add_argument("--e2e_clean_prob", type=float, default=0.1,
+    er.add_argument("--e2e_clean_prob", type=float, default=0.5,
                     help="Probability of overriding a draw to fully clean inputs "
-                         "(SVI: --clean_prob).")
+                         "(SVI: --clean_prob). SVI-Film's value; keeps half the outer steps "
+                         "uncorrupted so the predict loss keeps a clean signal to meta-shape "
+                         "phi_0 against.")
     er.add_argument("--e2e_error_modulate_factor", type=float, default=0.0,
                     help="Injected errors are scaled by uniform(1-f, 1+f) "
                          "(SVI: --error_modulate_factor).")
@@ -699,6 +881,10 @@ if __name__ == "__main__":
     _paths_str = str(args.model_paths) + str(getattr(args, "tokenizer_path", ""))
     _is_wan22 = "Wan2.2" in _paths_str or "TI2V-5B" in _paths_str
     _spatial_div = 32 if _is_wan22 else 16
+    # Path heuristic for the anchoring route, used ONLY by the length-grouped batching report
+    # below (a scheduling hint that cannot change what is trained). The authoritative selection
+    # reads the loaded DiT's flags -- see `self.anchor_route`.
+    _is_i2v_route = ("InP" in _paths_str or "I2V" in _paths_str) and not _is_wan22
     # ImageCropAndResize only snaps to the division factor when height/width are left
     # unset; with explicit sizes (our case) it crops verbatim. So snap them here too,
     # otherwise an explicit 720 stays 720 and re-triggers the odd-latent mismatch.
@@ -784,8 +970,12 @@ if __name__ == "__main__":
         if accelerator.is_main_process:
             # Report balance against the actual cost driver (chunk count), not raw length.
             _fpc = args.e2e_frames_per_chunk
-            _ov = anchor_overlap_pixel_frames(args.e2e_num_anchor_latent_frames,
-                                              args.e2e_condition_on_sink_frame)
+            # The i2v route's overlap is just the motion window; the fused route's also covers
+            # the sink displacement. Keep this in step with `self.anchor_overlap` or the
+            # straggler prediction below is modelling a different chunk count than we train.
+            _ov = (args.e2e_num_motion_frames if _is_i2v_route
+                   else anchor_overlap_pixel_frames(args.e2e_num_anchor_latent_frames,
+                                                    args.e2e_condition_on_sink_frame))
             _stride = (_fpc - _ov) if args.e2e_condition_on_last_frame else _fpc
             def _chunks(length):
                 f = int(length)
@@ -835,7 +1025,12 @@ if __name__ == "__main__":
         e2e_condition_on_last_frame=args.e2e_condition_on_last_frame,
         e2e_condition_on_sink_frame=args.e2e_condition_on_sink_frame,
         e2e_num_anchor_latent_frames=args.e2e_num_anchor_latent_frames,
+        e2e_num_motion_frames=args.e2e_num_motion_frames,
+        e2e_ref_pad_num=args.e2e_ref_pad_num,
+        e2e_ref_frame_source=args.e2e_ref_frame_source,
+        e2e_p_motion_threshold=args.e2e_p_motion_threshold,
         e2e_use_error_recycling=args.e2e_use_error_recycling,
+        e2e_shared_buffer_dir=args.e2e_shared_buffer_dir,
         e2e_num_grids=args.e2e_num_grids,
         e2e_error_buffer_k=args.e2e_error_buffer_k,
         e2e_buffer_warmup_iter=args.e2e_buffer_warmup_iter,
