@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# First-order (FOMAML) E2E-TTT meta-training for Wan2.1-Fun-V1.1-1.3B-InP. Identical to
-# Wan2.1-Fun-V1.1-1.3B-InP-e2e-ttt.sh except it passes --e2e_first_order, which drops the
-# Hessian term: the inner-loop graph is freed each step, fused attention is allowed
-# (no math-SDPA pin), and --e2e_truncate_steps is ignored. All other knobs come from
-# the same YAML config.
+# First-order (FOMAML) E2E-TTT meta-training for Wan2.1-Fun-V1.1-1.3B-InP, i2v anchor route.
+#
+# The algorithm comes from the CONFIG (`e2e_algorithm: fomaml`), not from a flag here — this
+# launcher only chooses which YAML to run and sets the allocator env. FOMAML drops the Hessian
+# term: each memorize graph is freed as its grad is taken, fused attention is allowed (no
+# math-SDPA pin), and --e2e_truncate_steps is ignored.
+#
 #   bash examples/wanvideo/model_training/lora/Wan2.1-Fun-V1.1-1.3B-InP-e2e-ttt-fomaml.sh
-#   ... --config <other.yaml>            # or point at the smoke config
+#   bash .../-fomaml.sh <other.yaml>                  # first positional arg is the config
+#   bash .../-fomaml.sh <cfg.yaml> --e2e_num_chunks 8 # extra args override the YAML
 set -e
 
 CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-Fun-V1.1-1.3B-InP-e2e-ttt-fomaml.yaml}"
-# CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-Fun-V1.1-1.3B-InP-e2e-ttt-fomaml.yaml}"
 
 # FOMAML's single-backward path uses far less memory than the second-order meta-backward,
 # but keep expandable_segments on to avoid allocator fragmentation stranding reserved VRAM.
