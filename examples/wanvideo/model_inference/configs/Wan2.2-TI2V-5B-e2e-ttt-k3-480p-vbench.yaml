@@ -23,11 +23,17 @@
 # forward is cheaper still. 14 latents also sits inside the base model's native
 # 121-frame / 31-latent extent, so no RoPE extrapolation.
 #
-# LENGTH CAVEAT: 53 + 40*23 = 973 frames (~61s @16fps), against the k=1 baseline's
-# 24 x 36 + 41 = 869 and the k3-720p arm's 49 + 36*23 = 877. VBench metrics are
-# length-sensitive, so this arm is ~11% longer than the ones it is read against. Set
-# num_chunks: 22 (53 + 40*21 = 893) if you want length parity instead of matching the
-# baseline's chunk COUNT.
+# LENGTH: 53 + 40*23 = 973 frames (~61s @16fps). The k3-720p arm
+# (Wan2.2-TI2V-5B-e2e-ttt-k3-720p-vbench.yaml) and the no-adaptation ablation
+# (Wan2.2-TI2V-5B-chunk-by-chunk-anchored-vbench.yaml) are both at the same fpc=53 /
+# 24 chunks, so all three k=3 arms are length-matched at 973 and VBench's
+# length-sensitivity drops out of the comparison.
+#
+# The k=1 arm (Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml) is also at fpc=53, but k=1 + sink
+# pins 2 latents = 5 pixel frames rather than 4 = 13, so it emits 48 new frames per
+# chunk and 1157 in total. k is exactly what sets the per-chunk overhead, so equal
+# chunk length and equal chunk count cannot also give equal total length against k=1;
+# reading k=3 against k=1 carries a ~16% length difference either way.
 #
 # THE RISK TO WATCH: the anchor gives 12 frames of context and constrains 40 generated
 # frames (30%). The anchor pins the first ~12 frames hard and the last ones barely at

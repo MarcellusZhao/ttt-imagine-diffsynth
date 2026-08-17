@@ -35,7 +35,7 @@ from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion.e2e_ttt import (
     InnerLoopConfig, InferenceConfig, inject_lora_for_ttt, WanE2ETTTSequentialGenerator,
-    num_clean_latents, num_pinned_pixel_frames,
+    num_clean_latents, num_pinned_pixel_frames, TTTDiagnostics,
 )
 
 
@@ -134,6 +134,23 @@ def parse_args():
                              "sees actual velocity instead of a motion-ambiguous single frame "
                              "-- the fix for next chunks that reverse the preceding motion.")
 
+    # Inner-loop diagnostics (off by default; see TTTDiagnostics in diffsynth/diffusion/e2e_ttt.py)
+    parser.add_argument("--ttt_diagnostics", type=str, default=None,
+                        help="Write a per-step JSONL trace of the test-time inner loop to this "
+                             "path: gradient norms before/after clipping, the displacement each "
+                             "optimizer step actually realized, cumulative ||phi - phi_0|| split "
+                             "over lora_A/lora_B, the effective ||B@A||/||W_base||, and two "
+                             "FIXED-timestep memorize probes per chunk (against the chunk just "
+                             "generated, and against chunk 0 held fixed for the whole video). "
+                             "For diagnosing quality falling off with chunk index -- the loss "
+                             "printed per chunk is a single random-sigma draw and cannot be read "
+                             "as a trend. Costs ~4 extra forwards per chunk; the sampling RNG "
+                             "stream is untouched, so clips stay byte-identical either way.")
+    parser.add_argument("--ttt_probe_seeds", type=int, default=2,
+                        help="Fixed (timestep, noise) draws averaged per probe. Only read when "
+                             "--ttt_diagnostics is set. 0 disables the probes and keeps the "
+                             "cheap per-step magnitudes.")
+
     # Output
     parser.add_argument("--output-dir", type=str, default=f"./results/custom-prompts",
                         help="Output directory.")
@@ -231,9 +248,17 @@ def main():
     # Built once as well: generate() restores the scratchpad to phi_0 before and after each
     # narrative, so looping over prompts here is exactly equivalent to one process per
     # prompt -- no adaptation bleeds from one video into the next.
+    # Owned here rather than inside the generator: the trace spans every prompt of this
+    # invocation, and `generate` re-attaches per narrative so each video's drift is measured
+    # from its own phi_0.
+    diagnostics = TTTDiagnostics(
+        args.ttt_diagnostics, num_probe_seeds=args.ttt_probe_seeds
+    ) if args.ttt_diagnostics else None
+
     generator = WanE2ETTTSequentialGenerator(
         pipe, inner_cfg, infer_cfg, phi0=phi0,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
+        diagnostics=diagnostics,
     )
 
     if args.condition_on_last_frame:
@@ -268,6 +293,11 @@ def main():
 
         save_video(frames, output_path, fps=args.fps, quality=args.quality)
         print(f"Saved a {len(frames)}-frame E2E-TTT long video with {args.algorithm} algorithm {conditioning} to {output_path}.")
+
+    if diagnostics is not None:
+        diagnostics.close()
+        print(f"[E2E-TTT] inner-loop trace written to {args.ttt_diagnostics}; summarize with:\n"
+              f"  python eval/ttt_diagnostics/summarize.py {args.ttt_diagnostics}")
 
     print(f"[E2E-TTT] generated {num_generated}/{len(prompts)} prompt(s) in {total_time:.1f}s total.")
 

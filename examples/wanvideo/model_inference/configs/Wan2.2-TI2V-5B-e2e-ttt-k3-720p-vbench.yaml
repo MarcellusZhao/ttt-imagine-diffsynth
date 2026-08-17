@@ -1,20 +1,33 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# EXPERIMENT A (inference) — k=3 wide anchor, frames_per_chunk 49.
+# EXPERIMENT A (inference) — k=3 wide anchor, frames_per_chunk 53.
 #
 # Pairs with model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p.yaml
 # (720x1280 training; sampling stays at 480x832, exactly as the k=1 baseline does).
 # Point `lora` at that run's phi_0.
 #
-# This is the controlled arm, and at fpc=49 it is genuinely like-for-like against the
-# k=1 baseline — same chunk count, same new frames per chunk, same total length:
+# Frame budget at frames_per_chunk=53, k=3 + sink:
+#   53 frames = 14 latents; 4 pinned (sink at latent 0, anchor block at 1..3);
+#   13 pinned pixel frames dropped at each boundary -> 40 NEW frames per chunk.
+#   53 + 40*23 = 973 frames at num_chunks: 24.
 #
-#                   fpc  latents  pinned  new frames/chunk  num_chunks  total
-#   k=1 baseline     41     11       2           36             24       869
-#   k=3 this config  49     13       4           36             24       877
+# 53 is the SAME chunk length the phi_0 was meta-trained at (e2e_frames_per_chunk: 53
+# in the paired training config), so test-time chunks are exactly the shape the inner
+# loop saw — no train/test chunk-length gap. It is also what the k3-480p arm
+# (Wan2.2-TI2V-5B-e2e-ttt-k3-480p-vbench.yaml) and the no-adaptation ablation
+# (Wan2.2-TI2V-5B-chunk-by-chunk-anchored-vbench.yaml) use, both likewise at 973
+# frames — so the k3 arms are length-matched to each other and the LoRA scratchpad is
+# the only thing that differs between this arm and the ablation.
 #
-# So the anchor width is the only variable that moved. (At fpc=41 a k=3+sink block
-# would drop this to 28 new frames per chunk, forcing a different num_chunks and
-# confounding the k comparison with a length difference — hence 49.)
+# HISTORY: this config previously ran fpc=49 (36 new frames/chunk, 877 total) to
+# length-match a k=1 baseline that was itself at fpc=41. Both have since moved to 53,
+# and the ablation was already there, so 49 only produced an 11% length gap against
+# every arm this one is read against — and VBench is length-sensitive.
+#
+# LENGTH CAVEAT: the k=1 arm (Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml) is also at fpc=53,
+# but k=1 + sink pins 2 latents = 5 pixel frames, so it emits 48 new frames per chunk
+# and 1157 in total. Comparing k=3 against k=1 therefore still carries a length
+# difference; matching CHUNK COUNT and chunk LENGTH across the two cannot also match
+# total length, because k is exactly what sets the per-chunk overhead.
 #
 # num_anchor_latent_frames MUST equal the checkpoint's
 # e2e_num_anchor_latent_frames — k sets both how many leading latents are pinned and
@@ -55,7 +68,7 @@ inner_loop:
   optimizer: adamw
   num_gradient_steps: 2
   num_mc_samples: 1
-  inner_lr_init: 1.0e-4
+  inner_lr_init: 1.0e-5
   max_inner_grad_norm: 1.0
 
 vbench:
@@ -65,11 +78,13 @@ vbench:
   base_seed: 0
 
 chunking:
-  # Same as the k=1 baseline: 49 + 36*23 = 877 frames vs its 869. VBench metrics are
-  # length-sensitive, so keeping these equal is what makes the arms comparable.
+  # 53 + 40*23 = 973 frames, equal to the k3-480p arm and to the no-adaptation
+  # ablation. VBench metrics are length-sensitive, so keeping these equal across the
+  # k3 arms is what makes them comparable.
   num_chunks: 24
-  # 49 = 4n+1; 49 - 13 pinned = 36 new frames per chunk, matching the baseline.
-  frames_per_chunk: 49
+  # 53 = 4n+1 -> 14 latents; 13 pinned pixel frames dropped -> 40 new frames per chunk.
+  # Also the chunk length phi_0 was meta-trained at, so there is no train/test gap.
+  frames_per_chunk: 53
   # k. MUST equal the checkpoint's e2e_num_anchor_latent_frames.
   num_anchor_latent_frames: 3
   ttt_steps_per_chunk: 1
@@ -78,14 +93,17 @@ chunking:
   condition_on_sink_frame: true
 
 generation:
-  height: 480
-  width: 832
+  height: 720
+  width: 1280
   num_inference_steps: 50
   cfg_scale: 5.0
   sigma_shift: 5.0
   negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
 output:
-  save_path: ./results/vbench/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p-fpc49
+  # Tagged with the chunk length: clips sampled at the old fpc=49 are 877 frames, not
+  # 973, and the drivers' --skip_existing matches on filename alone — a shared path
+  # would silently keep the stale ones.
+  save_path: ./results/vbench/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p-fpc53
   fps: 16
   quality: 5

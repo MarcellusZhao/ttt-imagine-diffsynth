@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# EXPERIMENT A — wide anchor (k=3) at 720p, frames_per_chunk 49.
+# EXPERIMENT A — wide anchor (k=3) at 720p, frames_per_chunk 53.
 #
-# E2E-TTT meta-training for Wan2.2-TI2V-5B. The controlled arm: everything matches
-# the k=1 baseline (Wan2.2-TI2V-5B-e2e-ttt-fomaml.yaml) except the anchor width and
-# the chunk length raised 41 -> 49 to pay for it. The point is a clean test of ONE
-# hypothesis: that reversed motion at chunk boundaries comes from the conditioning
-# carrying no velocity, not from weak memorization.
+# E2E-TTT meta-training for Wan2.2-TI2V-5B. The controlled arm: the anchor width is
+# the variable under test, and the chunk length is raised from the k=1 baseline's 41
+# to pay for it. The point is a clean test of ONE hypothesis: that reversed motion at
+# chunk boundaries comes from the conditioning carrying no velocity, not from weak
+# memorization.
 #
 # Why k>1 should matter: a single anchor latent is motion-unidentifiable — no
 # velocity can be read off one frame — so at k=1 the ONLY channel carrying motion
@@ -14,28 +14,43 @@
 # direction. k=3 pins the previous chunk's last 12 pixel frames, putting velocity
 # (and acceleration) directly in the conditioning.
 #
-# WHY 49 AND NOT 41. Pinned frames are given context, not supervised content, so a
-# k=3+sink block costs supervision — and 49 is exactly the length that buys it back:
+# WHY 53 AND NOT 41. Pinned frames are given context, not supervised content, so a
+# k=3+sink block costs supervision, and it widens the chunk overlap from the k=1
+# legacy path's 1 frame to 4k+1 = 13 — which costs stride. 53 buys back both:
 #
-#            latents  pinned  supervised  stride  new frames/chunk
-#   k=1 @41    11       2         9         40          36          <- baseline
-#   k=3 @41    11       4         7         28          28
-#   k=3 @49    13       4         9         36          36          <- this config
+#            latents  pinned  supervised  overlap  stride  new frames/chunk
+#   k=1 @41    11       2         9          1       40          36      <- baseline
+#   k=3 @41    11       4         7         13       28          28
+#   k=3 @49    13       4         9         13       36          36
+#   k=3 @53    14       4        10         13       40          40      <- this config
 #
-# At 49 the arm matches the baseline on supervised latents (9) AND on decoded frames
-# per chunk (36), so the paired inference config can run the same num_chunks: 24 for
-# the same total length. k is then the only variable that moved — which is the whole
-# point of this arm.
+# At 53 the arm carries MORE supervised latents than the baseline (10 vs 9) and
+# restores its training stride exactly (40), so clips chunk at the same cadence and
+# unroll depth is not what changed. Note "stride" (training chunk overlap) and "new
+# frames/chunk" (decoded yield after drop_boundary_frame) coincide at k=3 but not at
+# k=1, where the legacy 1-frame overlap is narrower than the 5 pixel frames the two
+# pinned latents actually cover — one of the asymmetries k>1 removes.
 #
-# Cost: 13 latents instead of 11 at 720x1280 is 1.18x the baseline's sequence length
-# (attention goes as the square, so ~1.4x there). Chunk overlap is 13 frames = 12
+# 53 is also the chunk length all three k=3 INFERENCE configs run
+# (…-e2e-ttt-k3-720p-vbench.yaml, …-k3-480p-vbench.yaml, and the no-adaptation
+# ablation …-chunk-by-chunk-anchored-vbench.yaml), so there is no train/test
+# chunk-length gap and those arms are length-matched at 973 frames.
+#
+# HISTORY: this config previously ran 49, chosen to match the k=1 baseline on
+# supervised latents (9) and decoded yield (36) while accepting a shorter stride (36
+# vs 40). 53 trades that for stride parity and train/test chunk parity. The measured
+# pair-density note that used to sit here ("4.3 pairs/clip vs the baseline's 4.0")
+# was taken at 49 and does not carry over — 53 needs 12 more frames before a clip
+# yields its first chunk, so short clips give one fewer.
+#
+# The k=1 baseline config itself (Wan2.2-TI2V-5B-e2e-ttt-fomaml.yaml) was deleted in
+# 32f9aee0; the numbers above are what remains of it. Its geometry still lives in the
+# k=1 inference config, Wan2.2-TI2V-5B-e2e-ttt-vbench.yaml.
+#
+# Cost: 14 latents instead of 11 at 720x1280 is 1.27x the baseline's sequence length
+# (attention goes as the square, so ~1.6x there). Chunk overlap is 13 frames = 12
 # anchored pixel frames plus one leading frame that exists only as VAE causal context
 # (the sink overwrites its latent). Confirm via train/anchor_overlap_frames.
-#
-# Measured on ultravideo_long_filtered_short_3k (300-clip sample, 10-20s @16fps,
-# median 209 frames), memorize->predict pairs per clip: 4.3 at this config vs the
-# baseline's 4.0, with 100% of clips usable and a near-identical max chunk count — so
-# unroll DEPTH is unchanged and only the per-forward cost rises.
 #
 # Run with:
 #   accelerate launch examples/wanvideo/model_training/train_e2e_ttt.py \
@@ -127,8 +142,32 @@ train:
   # switches the final write from `epoch-0.safetensors` to `step-<N>.safetensors`
   # (ModelLogger.on_training_end), which still fires.
   save_steps: 500
-  output_path: /work/nlp/hzhao/checkpoints/e2e-ttt/Wan2.2-TI2V-5B_e2e_ttt_fomaml_k3_720p_fpc53_antidrift_ffsink_uvl_fs_rsfps16_len_grouped_16k
+  output_path: /work/nlp/hzhao/checkpoints/e2e-ttt/Wan2.2-TI2V-5B_e2e_ttt_fomaml_k3_720p_fpc53_antidrift_buf500_rsfps16_len_grouped_16k
   remove_prefix_in_ckpt: pipe.dit.
+  # NOT optional at 720p. It is honoured on BOTH the memorize and predict paths of
+  # meta-training -- `compute_flow_matching_loss` sets `gc = use_gradient_checkpointing`
+  # with no forcing, and `_override_checkpointed_blocks` keeps it compatible with the
+  # differentiable LoRA override by threading phi_k in as explicit checkpoint inputs. So
+  # the measured memory model in e2e_ttt below (alloc ~= 10.8 + 3.56 * num_chunks) is the
+  # CHECKPOINTED number.
+  #
+  # Turning it off replaces ~2.3 GB of retained block inputs per predict graph with the
+  # full intra-block activations. At 14 latents / 704x1280 the sequence is
+  # 14 * (44/2) * (80/2) = 12320 tokens, and one DiTBlock retains roughly
+  #   norm/q/k/v/attn-out/o (~6 x 12320 x 3072 x 2B) + ffn.0 and GELU (2 x 12320 x 14336
+  #   x 2B) + residuals  ~= 1.5 GB
+  # so ~45 GB across 30 blocks. FOMAML holds ONE such graph per memorize->predict pair
+  # until the single outer backward, which turns the 3.56 GB/chunk slope into ~46:
+  #
+  #   N=2 -> ~57 GB (fits)   N=3 -> ~103 GB (OOM)   N=6 (median) -> ~287 GB
+  #
+  # The dataset's MINIMUM is 3 chunks, so every clip would die. Even halving the estimate
+  # only moves the failure from N=3 to N=6. 480p is not a way out either: 5460 tokens is
+  # 44% of 720p, so ~20 GB/graph, and the median 6-chunk clip still lands at ~111 GB.
+  #
+  # If the goal is wall-clock, the ~25% checkpointing overhead is not the lever to pull --
+  # 82% of a step is fixed cost (see length_grouped_batching above). Cap e2e_num_chunks
+  # only if you also accept losing unroll depth, which is the meta-objective itself.
   use_gradient_checkpointing: true
 
 lora:
@@ -142,30 +181,42 @@ logger:
   wandb_project: E2E-TTT
 
 e2e_ttt:
-  # HARD memory cap, not an optimization. FOMAML accumulates one live predict graph per
-  # memorize->predict pair (`meta_loss = meta_loss + loss_pred` in run_meta_inner_loop) and
-  # the runner backwards ONCE, so peak VRAM is LINEAR in the chunk count of the clip. Measured
-  # on this exact config (job 3997049, 8x H100 80/93GB, wandb gpu/mem_alloc_gb vs
-  # train/num_chunks -- the fit is essentially exact, R^2 ~ 1):
+  # 0 = adaptive: one chunk per `frames_per_chunk` of the clip's real length, i.e. the FULL
+  # video, no truncation. 720p now trains this way end to end; the cap below is history, kept
+  # because the cost model it records is still the right one to reason with.
+  #
+  # FOMAML accumulates one live predict graph per memorize->predict pair
+  # (`meta_loss = meta_loss + loss_pred` in run_meta_inner_loop) and the runner backwards
+  # ONCE, so peak VRAM is still LINEAR in the chunk count of the clip. Measured on this exact
+  # config (job 3997049, 8x H100 80/93GB, wandb gpu/mem_alloc_gb vs train/num_chunks -- the
+  # fit is essentially exact, R^2 ~ 1):
   #
   #     alloc_GB  ~=  10.8  +  3.56 * num_chunks        (+ ~4 GB transient -> peak)
   #
-  #   N=6 -> 32 GB    N=11 -> 50 GB    N=16 -> 68 GB    N=20 -> 82 GB (peak 85.8, survived)
-  #   N=22 -> 89 GB  ==>  OOM at step 55 on 4 of 8 ranks.
+  #   N=6 -> 32 GB    N=11 -> 50 GB    N=16 -> 68 GB    N=20 -> 82 GB    N=22 -> 89 GB
   #
-  # The stale note this replaces ("median 5 chunks, max 8 on the sampled clips") described
-  # ultravideo_long_filtered_short_3k, a LENGTH-FILTERED subset. This config reads
-  # ultravideo_long_filtered_all_16k_len.csv: 160..960 frames, i.e. 3..23 chunks at stride 40.
-  # 1.7% of those clips exceed 20 chunks -- enough that a multi-hour run always eventually
-  # draws one, which is why the crash came at step 55 rather than step 1.
+  # That job OOM'd at N=22 (step 55, 4 of 8 ranks) and is where the old `e2e_num_chunks: 16`
+  # ceiling came from. What made the cap unnecessary is the ALLOCATOR, not a smaller graph:
+  # 3997049 ran without `expandable_segments`, and died holding 7.69 GiB reserved-but-
+  # unallocated while asking for 338 MiB -- 8% of the card lost to fragmentation on exactly
+  # the workload that provokes it (large, repeated, differently-sized allocations, all freed
+  # at once at the outer backward). Every e2e-ttt launcher now exports
+  # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which reclaims most of that, so the
+  # numbers above are read as allocated ~= reserved rather than allocated + 8%.
   #
-  # 16 leaves ~20 GB of headroom and truncates only the 4.2% of clips with >16 chunks. Raising
-  # it trades that headroom for pairs; do not exceed 20 on a 93 GB card. NOTE the truncation
-  # keeps the clip's FIRST n chunks (see _encode_chunks), so long clips only ever train on
-  # their opening -- a coverage bias, not a correctness bug.
-  e2e_num_chunks: 21
-  # 49 = 13 latents; with 4 pinned that leaves 9 supervised, matching the k=1 baseline,
-  # and 49 - 13 = 36 new decoded frames per chunk, also matching it.
+  # Know where the ceiling is before raising fpc or resolution: this config reads
+  # ultravideo_long_filtered_all_16k_len.csv (160..960 frames = 3..23 chunks at stride 40),
+  # so the longest clips land at ~93 GB allocated -- comfortable in practice but not roomy,
+  # and 1.7% of clips exceed 20 chunks, enough that a multi-hour run always eventually draws
+  # one. If a long clip does OOM, re-capping here is the first knob: set it to 16 for ~20 GB
+  # of headroom at the cost of truncating the 4.2% of clips with >16 chunks. NOTE the
+  # truncation keeps the clip's FIRST n chunks (see _encode_chunks), so a cap makes long
+  # clips train only on their opening -- a coverage bias, not a correctness bug, and the
+  # reason adaptive is preferred now that it fits.
+  e2e_num_chunks: 0
+  # 53 = 4n+1 -> 14 latents; with 4 pinned (sink at latent 0, anchor block at 1..3)
+  # that leaves 10 supervised, and 53 - 13 overlap = 40 new decoded frames per chunk.
+  # Matches the chunk length all three k=3 inference configs use. See the header.
   e2e_frames_per_chunk: 53
   # THE experimental variable. 3 anchor latents = the previous chunk's last 12 pixel
   # frames, pinned at latent positions 1..3 (position 0 goes to the sink).
@@ -191,9 +242,52 @@ e2e_ttt:
   # provide, so the block path is not optional — see ErrorRecycler.harvest.
   e2e_use_error_recycling: true
   e2e_num_grids: 50
-  e2e_error_buffer_k: 96
+  # ── ONE arena per NODE, not per rank. THIS LINE IS WHAT MAKES k=500 BELOW POSSIBLE;
+  # the two must be changed together. Buffers are HOST RAM (`.cpu()` in the harvest
+  # path) and host RAM is the binding constraint on this arm -- not GPU.
+  #
+  # VERIFIED on kh009 (2026-08-16): slurm sets TMPDIR=/tmp/<jobid>, and /tmp there is
+  # /dev/nvme0n1p5 -- xfs on node-local NVMe, 5.8 TB with 5.7 TB free. So this is real
+  # local disk, per job, and 143.6 GB is 2.5% of it. On a multi-node run each node gets
+  # its own physical directory behind the same path string, which is exactly the
+  # per-node arena we want. `${VAR}` and `~` are expanded; an UNSET variable raises at
+  # startup rather than creating a literal "${TMPDIR}" dir on shared storage.
+  #
+  # Do NOT "simplify" this to /dev/shm. That also works (189 GB tmpfs, verified) but
+  # tmpfs pages are unreclaimable with ~1 GiB of swap on a 377 GiB node, whereas these
+  # are ordinary page cache the kernel can evict under pressure. And since
+  # JobContainerType is null there is no private /tmp namespace, so nothing is auto-
+  # purged: a segment leaked by an OOM-kill (SIGKILL -- no cleanup handler runs) would
+  # cost the NEXT job pinned RAM under tmpfs, versus identifiable files under
+  # /tmp/<jobid> here.
+  #
+  # If the directory is unusable the code warns and falls back to per-rank buffers --
+  # which at k=500 is ~709 GB/rank and dies. The warning prints that number in the
+  # first seconds of the log; do not ignore it.
+  e2e_shared_buffer_dir: ${TMPDIR}/e2e_ttt_errbuf
+  # 500 = SVI's own buffer size, affordable only because the arena is shared.
+  # At 704x1280 / fpc=53 the chunk latent is 48 x 14 x 44 x 80 x 2B = 4.73 MB and the
+  # k=3 anchor slice 1.01 MB, so one unit of k costs 50 grids x 5.74 MB = 0.287 GB:
+  #
+  #        k     shared/node     per-rank x4
+  #       50        14.4 GB         57.4 GB     <- previous setting
+  #       96        27.6 GB        110.3 GB
+  #      500       143.6 GB        574.5 GB     <- this config (per-rank: impossible)
+  #
+  # Budget: --mem=368G minus ~115 GB measured non-buffer (model CPU copies, umt5, VAE,
+  # optimizer state, and the dataloader's in-flight frames at ~2.8 MB/frame) leaves
+  # ~253 GB, so 143.6 GB uses 57% of the headroom. k_max is 880 against that raw figure,
+  # ~750 if you also keep a 10% safety margin. Recompute with max_shared_k() in
+  # e2e_ttt.py if fpc, resolution or num_grids changes -- all three move the per-slot cost.
+  #
+  # NOTE what this does and does not buy: `err_buffer/miss_rate` was already 0 at k=96,
+  # so everything past saturation buys DIVERSITY, not coverage. Also the write rate per
+  # rank is unchanged -- each of 4 ranks owns 125 of the 500 slots per grid -- so the
+  # pool takes proportionally longer to fill than k=50 did; watch
+  # `err_buffer/total_samples` plateau before reading anything into an ablation.
+  e2e_error_buffer_k: 500
   e2e_buffer_warmup_iter: 20
-  e2e_noise_prob: 0.9
+  e2e_noise_prob: 0.01
   e2e_latent_prob: 0.9
   e2e_y_prob: 0.9
-  e2e_clean_prob: 0.1
+  e2e_clean_prob: 0.5

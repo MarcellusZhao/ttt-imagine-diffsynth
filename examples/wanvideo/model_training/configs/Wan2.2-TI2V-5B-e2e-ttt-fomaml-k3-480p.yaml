@@ -141,7 +141,7 @@ train:
   lr_warmup_steps: 30
   lr_min_ratio: 0.1
   num_epochs: 1
-  output_path: /work/nlp/hzhao/checkpoints/e2e-ttt/Wan2.2-TI2V-5B_e2e_ttt_fomaml_k3_480p_fpc53_antidrift_inner_lr1e-5_uvl_fs_rsfps16_len_grouped_16k
+  output_path: /work/nlp/hzhao/checkpoints/e2e-ttt/Wan2.2-TI2V-5B_e2e_ttt_fomaml_k3_480p_fpc53_antidrift_buf500_rsfps16_len_grouped_16k
   remove_prefix_in_ckpt: pipe.dit.
   use_gradient_checkpointing: true
 
@@ -181,11 +181,43 @@ e2e_ttt:
   e2e_first_order: true
   e2e_use_error_recycling: true
   e2e_num_grids: 50
-  # Errors are stored per-shape, and this run's chunk shape (14 latents @ 480x832) is
-  # smaller than the 720p baseline's, so the same k buys more buffer per GB.
-  e2e_error_buffer_k: 96
+  # ── ONE arena per NODE, not per rank. THIS LINE IS WHAT MAKES k=500 BELOW POSSIBLE;
+  # the two must be changed together. Buffers are HOST RAM (`.cpu()` in the harvest
+  # path), and host RAM -- not GPU -- is what OOM-killed the 720p runs.
+  #
+  # VERIFIED on kh009 (2026-08-16): slurm sets TMPDIR=/tmp/<jobid>, and /tmp there is
+  # /dev/nvme0n1p5 -- xfs on node-local NVMe, 5.8 TB with 5.7 TB free. Real local disk,
+  # per job; on a multi-node run each node gets its own physical directory behind the
+  # same path string, which is exactly the per-node arena we want. `${VAR}` and `~` are
+  # expanded; an UNSET variable raises at startup rather than creating a literal
+  # "${TMPDIR}" dir on shared storage. See the 720p config for why not /dev/shm.
+  #
+  # If the directory is unusable the code warns and falls back to per-rank buffers --
+  # which at k=500 is ~314 GB/rank and dies. The warning prints that number in the
+  # first seconds of the log; do not ignore it.
+  e2e_shared_buffer_dir: ${TMPDIR}/e2e_ttt_errbuf
+  # 500 = SVI's own buffer size, affordable only because the arena is shared. The
+  # affordable k is resolution-dependent: at 480x832 / fpc=53 the chunk latent is
+  # 48 x 14 x 30 x 52 x 2B = 2.10 MB and the k=3 anchor slice 0.45 MB, so one unit of
+  # k costs 50 grids x 2.55 MB = 0.127 GB -- 2.3x cheaper than the 720p arm's 0.287 GB:
+  #
+  #        k     shared/node     per-rank x4
+  #       96        12.2 GB         48.9 GB     <- previous setting
+  #      500        63.6 GB        254.6 GB     <- this config
+  #
+  # Against --mem=368G minus ~100 GB non-buffer (lower than the 720p arm's ~115 GB:
+  # the dataloader carries ~1.2 MB/frame here, not ~2.8) that is 24% of the headroom,
+  # and k_max is ~2100 -- memory is nowhere near binding at this resolution. Both k=3
+  # arms now run the same k=500, so the buffer is no longer a variable between them.
+  #
+  # NOTE what this does and does not buy: `err_buffer/miss_rate` was already 0 at k=96,
+  # so everything past saturation buys DIVERSITY, not coverage. Also the write rate per
+  # rank is unchanged -- each of 4 ranks owns 125 of the 500 slots per grid -- so the
+  # pool takes proportionally longer to fill than k=96 did; watch
+  # `err_buffer/total_samples` plateau before reading anything into an ablation.
+  e2e_error_buffer_k: 500
   e2e_buffer_warmup_iter: 20
-  e2e_noise_prob: 0.9
+  e2e_noise_prob: 0.01 # [0.01, 0.9]
   e2e_latent_prob: 0.9
   e2e_y_prob: 0.9
-  e2e_clean_prob: 0.1
+  e2e_clean_prob: 0.5 # [0.5, 0.9]

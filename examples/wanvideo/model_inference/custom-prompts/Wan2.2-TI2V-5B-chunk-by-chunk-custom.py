@@ -159,8 +159,7 @@ def main():
     print(f"[chunk-by-chunk] loaded the pipeline in {time.time() - load_start:.1f}s "
           f"for {len(prompts)} prompt(s)")
 
-    conditioning = "with" if args.condition_on_last_chunk else "without"
-    output_name = f"Wan2.2-TI2V-5B-chunk-by-chunk-{conditioning}-conditioning.mp4"
+    output_name = f"Wan2.2-TI2V-5B-chunk-by-chunk-{args.height}p.mp4"
 
     run_time = 0.0
     num_generated = 0
@@ -181,6 +180,7 @@ def main():
 
         save_video(all_frames, output_path, fps=args.fps, quality=args.quality)
         print(f"Total time taken to generate video: {total_time} seconds")
+        conditioning = "with" if args.condition_on_last_chunk else "without"
         print(f"Saved a {len(all_frames)}-frame chunk-by-chunk video {conditioning} conditioning to {output_path}.")
 
     print(f"[chunk-by-chunk] generated {num_generated}/{len(prompts)} prompt(s) "
