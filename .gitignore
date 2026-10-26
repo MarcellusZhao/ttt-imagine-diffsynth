@@ -183,3 +183,14 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+# Local Gemini API key helper — a live credential, never commit it.
+# The scoring sbatch reads GEMINI_API_KEY from the submitting environment by design.
+eval/visionreward/gemini_vr.sh
+
+# Hand-copied fonts for visualize/plot_frame_comparison.py (Avenir Next is commercial)
+visualize/fonts/
+eval/
+visualize/
+svi-prompts/
+*.yaml
+custom-prompts/
