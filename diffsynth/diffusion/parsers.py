@@ -55,6 +55,18 @@ def add_lora_config(parser: argparse.ArgumentParser):
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
     parser.add_argument("--lora_rank", type=int, default=32, help="Rank of LoRA.")
     parser.add_argument("--lora_checkpoint", type=str, default=None, help="Path to the LoRA checkpoint. If provided, LoRA will be loaded from this checkpoint.")
+    parser.add_argument(
+        "--lora_fp32", default=False, action="store_true",
+        help="Keep the trainable LoRA leaves in fp32 instead of the pipeline dtype (bf16). "
+             "REQUIRED whenever the outer learning rate approaches bf16's quantum at LoRA's "
+             "parameter scale: AdamW moves each coordinate by ~lr regardless of gradient size, "
+             "and bf16's half-ulp at |phi| ~ 7.4e-3 is 1.5e-5, so at lr 1e-5 an in-place step is "
+             "silently discarded for ~73%% of lora_A coefficients (measured), with the frozen set "
+             "chosen by parameter magnitude. The update is in-place with no fp32 master, so what "
+             "is discarded never accumulates. Harmless but unnecessary at lr 1e-4 (0.0-0.1%% "
+             "frozen). Costs 2x the adapter's bytes in params, grads and optimizer states "
+             "(~4.9 GB/rank at 14B rank-128). Same fix the test-time inner loop already has.",
+    )
     parser.add_argument("--preset_lora_path", type=str, default=None, help="Path to the preset LoRA checkpoint. If provided, this LoRA will be fused to the base model.")
     parser.add_argument("--preset_lora_model", type=str, default=None, help="Which model the preset LoRA is fused to.")
     return parser

@@ -13,6 +13,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         tokenizer_path=None, audio_processor_path=None,
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        lora_fp32=False,
         preset_lora_path=None, preset_lora_model=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
@@ -44,7 +45,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             self.pipe, trainable_models,
             lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
             preset_lora_path, preset_lora_model,
-            task=task,
+            task=task, lora_fp32=lora_fp32,
         )
         
         # Store other configs

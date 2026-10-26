@@ -269,7 +269,7 @@ class DiffusionTrainingModule(torch.nn.Module):
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
-        task="sft",
+        task="sft", lora_fp32=False,
     ):
         # Scheduler
         pipe.scheduler.set_timesteps(1000, training=True)
@@ -291,11 +291,19 @@ class DiffusionTrainingModule(torch.nn.Module):
                 print(f"No {lora_base_model} models in the pipeline. We cannot patch LoRA on the model. If this occurs during the data processing stage, it is normal.")
                 return
             model = pipe if lora_base_model == "" else getattr(pipe, lora_base_model)
+            # `lora_fp32` keeps the trainable leaves in fp32 rather than the pipeline dtype.
+            # The outer optimizer steps these tensors IN PLACE with no fp32 master (runner.py
+            # builds a plain AdamW over them and the launchers pass no --mixed_precision), and
+            # AdamW's per-coordinate step is ~lr however small the gradient got. bf16's half-ulp
+            # at lora_A's scale (median |x| 7.4e-3 -> ulp 3.05e-5) is 1.5e-5, so at lr 1e-5 the
+            # step rounds away for ~73% of coefficients and, being in place, is never recovered.
+            # Default False keeps every existing arm bitwise reproducible; lr 1e-4 arms are
+            # unaffected either way (0.0-0.1% frozen). See --lora_fp32 in parsers.py.
             model = self.add_lora_to_model(
                 model,
                 target_modules=self.parse_lora_target_modules(model, lora_target_modules),
                 lora_rank=lora_rank,
-                upcast_dtype=pipe.torch_dtype,
+                upcast_dtype=torch.float32 if lora_fp32 else pipe.torch_dtype,
             )
             if lora_checkpoint is not None:
                 if isinstance(lora_checkpoint, str):
