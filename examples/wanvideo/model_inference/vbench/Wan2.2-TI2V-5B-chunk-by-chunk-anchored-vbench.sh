@@ -35,7 +35,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${CONFIG:-$SCRIPT_DIR/../configs/Wan2.2-TI2V-5B-chunk-by-chunk-anchored-vbench.yaml}"
-SAVE_PATH="${SAVE_PATH:-/work/nlp/hzhao/evaluations/vbench/Wan2.2-TI2V-5B-chunk-by-chunk-anchored-k3-ffsink-480h-832w-fpc53-60s}"
+SAVE_PATH="${SAVE_PATH:-/work/nlp/hzhao/evaluations/vbench/Wan2.2-TI2V-5B-chunk-by-chunk-anchored-k3-ffsink-720p-fpc133-24fps-60s}"
 VBENCH_ROOT="${VBENCH_ROOT:-/home/hzhao/VBench}"
 
 DIMENSION="${1:-all}"

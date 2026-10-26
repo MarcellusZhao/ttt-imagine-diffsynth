@@ -104,6 +104,20 @@ def parse_args():
                         help="Initial inner-loop learning rate.")
     parser.add_argument("--max_inner_grad_norm", type=float, default=1.0,
                         help="Gradient-norm clip for the inner loop.")
+    parser.add_argument("--drop_text_in_memorize", action="store_true",
+                        help="Run the memorize (TTT) loss on the EMPTY prompt instead of the "
+                             "chunk's. Part of the inner rule, so it MUST match the checkpoint: "
+                             "set it iff phi_0 was meta-trained with "
+                             "--e2e_drop_text_in_memorize (train/drop_text_in_memorize == 1).")
+    # The negation exists because the YAML --config can set `drop_text_in_memorize: true`
+    # as the argparse default, and a store_true flag cannot be turned back off from the
+    # CLI. Without this a text-conditioned phi_0 sampled under a text-free config would
+    # silently get the wrong inner rule (it did: the step-1844 uvl16k arm, 2026-08-26).
+    parser.add_argument("--no_drop_text_in_memorize", dest="drop_text_in_memorize",
+                        action="store_false",
+                        help="Keep the chunk's own prompt in the memorize loss, overriding a "
+                             "`drop_text_in_memorize: true` in the YAML config. Use for a "
+                             "phi_0 meta-trained WITHOUT --e2e_drop_text_in_memorize.")
 
     # VBench prompt selection
     parser.add_argument("--vbench_root", type=str, default=DEFAULT_VBENCH_ROOT,
@@ -326,6 +340,7 @@ def main():
         num_mc_samples=args.num_mc_samples,
         inner_lr_init=args.inner_lr_init,
         max_inner_grad_norm=args.max_inner_grad_norm,
+        drop_text_in_memorize=args.drop_text_in_memorize,
         optimizer=args.optimizer,
     )
     infer_cfg = InferenceConfig(
