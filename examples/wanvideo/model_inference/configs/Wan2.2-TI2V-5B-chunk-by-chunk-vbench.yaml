@@ -32,8 +32,8 @@ vbench:
   base_seed: 0                   # clip i uses chunk seeds base_seed + i*num_chunks + k
 
 chunking:
-  num_chunks: 24                  # contiguous sub-clips concatenated per VBench clip
-  frames_per_chunk: 41           # 4n+1 for the Wan temporal VAE
+  num_chunks: 12                  # contiguous sub-clips concatenated per VBench clip
+  frames_per_chunk: 121           # 4n+1 for the Wan temporal VAE
   condition_on_last_chunk: true  # anchor each chunk on the previous chunk's last frame (native I2V)
 
 generation:
@@ -45,5 +45,5 @@ generation:
 
 output:
   save_path: ./results/vbench/Wan2.2-TI2V-5B-chunk-by-chunk
-  fps: 16
+  fps: 24
   quality: 5
