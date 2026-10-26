@@ -232,6 +232,15 @@ e2e_ttt:
   e2e_inner_lr: 1.0e-5
   e2e_max_inner_grad_norm: 1.0
   e2e_inner_optimizer: adamw
+  # Text conditioning in the MEMORIZE loss. `false` = the memorize step sees the clip's own
+  # prompt (this repo's long-standing behaviour). `true` runs it on the EMPTY prompt instead,
+  # so the scratchpad cannot explain the chunk via the text and has to store the trajectory
+  # (SlowFast-VGen arXiv:2410.23277 Eq. 3). Stated explicitly rather than defaulted because it
+  # is part of the inner *rule*: flipping it here REQUIRES `drop_text_in_memorize: true` in the
+  # inference config as well. Unlike k or the sink, a mismatch here is SILENT in the
+  # train-true/sample-false direction — nothing at sampling time knows how phi_0 was trained —
+  # so the pair has to be maintained by hand, exactly like inner_optimizer.
+  e2e_drop_text_in_memorize: true
   e2e_truncate_steps: []
   e2e_sigma_shift: 5.0
   e2e_first_order: true
