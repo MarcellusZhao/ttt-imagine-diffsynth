@@ -78,6 +78,8 @@ def parse_args():
     # Output
     parser.add_argument("--output-dir", type=str, default=f"./results/custom-prompts",
                         help="Output directory.")
+    parser.add_argument("--output_name", type=str, default=None,
+                        help="Output video name (default: Wan2.2-TI2V-5B-chunk-by-chunk-<height>p.mp4).")
     parser.add_argument("--fps", type=int, default=16, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=5, help="Output video quality.")
     parser.add_argument("--skip_existing", action="store_true",
@@ -159,7 +161,10 @@ def main():
     print(f"[chunk-by-chunk] loaded the pipeline in {time.time() - load_start:.1f}s "
           f"for {len(prompts)} prompt(s)")
 
-    output_name = f"Wan2.2-TI2V-5B-chunk-by-chunk-{args.height}p.mp4"
+    if args.output_name:
+        output_name = args.output_name
+    else:
+        output_name = f"Wan2.2-TI2V-5B-chunk-by-chunk-{args.height}p.mp4"
 
     run_time = 0.0
     num_generated = 0

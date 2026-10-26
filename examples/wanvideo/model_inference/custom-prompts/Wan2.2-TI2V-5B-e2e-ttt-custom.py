@@ -86,6 +86,11 @@ def parse_args():
                         help="Initial inner-loop learning rate.")
     parser.add_argument("--max_inner_grad_norm", type=float, default=1.0,
                         help="Gradient-norm clip for the inner loop.")
+    parser.add_argument("--drop_text_in_memorize", action="store_true",
+                        help="Run the memorize (TTT) loss on the EMPTY prompt instead of the "
+                             "chunk's. Part of the inner rule, so it MUST match the checkpoint: "
+                             "set it iff phi_0 was meta-trained with "
+                             "--e2e_drop_text_in_memorize (train/drop_text_in_memorize == 1).")
 
     # Inference / chunking config
     parser.add_argument("--num_chunks", type=int, default=4,
@@ -221,6 +226,7 @@ def main():
         num_mc_samples=args.num_mc_samples,
         inner_lr_init=args.inner_lr_init,
         max_inner_grad_norm=args.max_inner_grad_norm,
+        drop_text_in_memorize=args.drop_text_in_memorize,
         optimizer=args.optimizer,
     )
     infer_cfg = InferenceConfig(
