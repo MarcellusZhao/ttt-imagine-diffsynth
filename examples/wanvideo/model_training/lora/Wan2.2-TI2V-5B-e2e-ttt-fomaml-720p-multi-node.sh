@@ -28,13 +28,7 @@ if [ -z "${SLURM_JOB_ID}" ] || [ -z "${SLURM_JOB_NODELIST}" ]; then
     exit 1
 fi
 
-# CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p.yaml}"
-# The fpc133 default below was retired 2026-09-05: its latent cache (fpc133-s120-...) was deleted
-# on 2026-09-02 to make room for the fpc121 one, so it now fails at startup as a missing directory.
-# CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p-24fps-5s-chunk-cached.yaml}"
-# fpc121 / data v5.1 / latent-cached (cache complete, verified 2026-09-05). For the UltraVideo-only
-# cheap-iteration list pass ...-4.5s-chunk-data-v5.2-cached.yaml as $1 instead.
-CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p-24fps-5s-chunk-uvl16k-dsroot-cached.yaml}"
+CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.2-TI2V-5B-e2e-ttt-fomaml-k3-720p.yaml}"
 
 NUM_NODES="${SLURM_NNODES:-${SLURM_JOB_NUM_NODES:-1}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-4}}"

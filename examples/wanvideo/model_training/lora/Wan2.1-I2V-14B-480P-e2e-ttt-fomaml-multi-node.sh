@@ -28,7 +28,7 @@ if [ -z "${SLURM_JOB_ID}" ] || [ -z "${SLURM_JOB_NODELIST}" ]; then
     exit 1
 fi
 
-CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-I2V-14B-480P-e2e-ttt-fomaml-data-v4.1.yaml}"
+CONFIG="${1:-examples/wanvideo/model_training/configs/Wan2.1-I2V-14B-480P-e2e-ttt-fomaml.yaml}"
 
 NUM_NODES="${SLURM_NNODES:-${SLURM_JOB_NUM_NODES:-1}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-4}}"
